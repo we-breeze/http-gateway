@@ -1,0 +1,7 @@
+# An empty route set forwards every request to the fallback origin.
+routes = []
+
+# [[routes]]
+# methods = ["GET"]
+# path = "/api/example"
+# match_kind = "exact"
