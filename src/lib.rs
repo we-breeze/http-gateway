@@ -10,7 +10,7 @@ mod gateway;
 mod proxy;
 mod server;
 
-pub use config::{ConfigError, PathMatch, RouteRule, RouteTable, RoutesConfig};
+pub use config::{ConfigError, RouteRule, RouteTable, RoutesConfig};
 pub use gateway::{Gateway, MatchedService, OriginService, RejectMatched};
 pub use proxy::{BoxError, GatewayBody, GatewayResponse, ProxyConfigError};
 pub use server::{GatewayConfig, bind, serve, serve_with_config};

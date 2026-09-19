@@ -30,7 +30,8 @@ routes = []
 # [[routes]]
 # methods = ["GET", "HEAD"]
 # path = "/api/health"
-# match_kind = "exact" # or "prefix"
+# Literal paths are exact. Use `:name` for one path segment or terminal
+# `*name` for the remaining path segments.
 ```
 
 Only an origin-only `http://` fallback URL is accepted. TLS termination and

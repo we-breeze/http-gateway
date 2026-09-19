@@ -12,6 +12,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "brz-http-gateway"
 version = "0.1.0"
 dependencies = [
+ "brz-http-router",
  "bytes",
  "http",
  "http-body-util",
@@ -22,6 +23,16 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "brz-http-router"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e40c111e79750c5484ab78d01c1f4d07c196e19a4a4d083e1e5c6d9bc77a3e7"
+dependencies = [
+ "http",
+ "thiserror",
 ]
 
 [[package]]

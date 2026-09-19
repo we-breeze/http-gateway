@@ -4,4 +4,3 @@ routes = []
 # [[routes]]
 # methods = ["GET"]
 # path = "/api/example"
-# match_kind = "exact"
