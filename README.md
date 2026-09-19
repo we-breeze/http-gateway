@@ -37,6 +37,21 @@ Only an origin-only `http://` fallback URL is accepted. TLS termination and
 HTTP/2 can be provided by an outer ingress; the local fallback hop remains
 HTTP/1.1 so upgrade tunneling is explicit and deterministic.
 
+`serve` applies bounded defaults: 65,536 downstream connections, a 32 KiB
+request-head buffer, a 15 second request-head timeout, and `TCP_NODELAY`.
+Use `serve_with_config` with `GatewayConfig` when an application needs different
+listener limits. Request and response bodies remain streamed rather than being
+buffered or subject to a whole-request timeout.
+
+Enable `gateway-log` to emit access events to `breeze.gateway`. With
+`brz-logs`, they are written to `gateway.log` in positional form with method,
+raw target, status, elapsed time, request length, and response length. Unknown
+lengths use `-`:
+
+```text
+2026-09-19 18:13:02 [GATEWAY] GET /api/quota?q=a 200 102ms - 133
+```
+
 ## Crate naming
 
 The package is `brz-http-gateway`; import it as `brz_http_gateway`.
