@@ -40,11 +40,21 @@ pub struct RouteRule {
     pub methods: Vec<String>,
     /// Absolute request path. Query parameters are not used for matching.
     pub path: String,
+    /// Whether the gateway access log should include this route.
+    #[serde(default = "default_log")]
+    pub log: bool,
+}
+
+const fn default_log() -> bool {
+    true
 }
 
 /// Validated route table shared by gateway connections.
 #[derive(Clone, Debug, Default)]
-pub struct RouteTable(brz_http_router::RouteTable);
+pub struct RouteTable {
+    matcher: brz_http_router::RouteTable,
+    silent: brz_http_router::RouteTable,
+}
 
 impl RouteTable {
     #[must_use]
@@ -57,7 +67,9 @@ impl RouteTable {
     /// # Errors
     /// Returns an error for an invalid method or malformed route template.
     pub fn compile(config: RoutesConfig) -> Result<Self, ConfigError> {
-        let routes = config
+        let mut routes = Vec::new();
+        let mut silent = Vec::new();
+        config
             .routes
             .into_iter()
             .enumerate()
@@ -70,27 +82,40 @@ impl RouteTable {
                             .map_err(|_| ConfigError::InvalidMethod { index, method })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(brz_http_router::RouteRule::new(rule.path, methods))
+                let route = brz_http_router::RouteRule::new(rule.path, methods.clone());
+                if !rule.log {
+                    silent.push(route.clone());
+                }
+                routes.push(route);
+                Ok(())
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
-        brz_http_router::RouteTable::compile(routes)
-            .map(Self)
+        let matcher = brz_http_router::RouteTable::compile(routes);
+        let silent = brz_http_router::RouteTable::compile(silent);
+        matcher
+            .and_then(|matcher| silent.map(|silent| Self { matcher, silent }))
             .map_err(ConfigError::Route)
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.matcher.is_empty()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.matcher.len()
     }
 
     #[must_use]
     pub fn matches(&self, method: &Method, path: &str) -> bool {
-        self.0.matches(method, path)
+        self.matcher.matches(method, path)
+    }
+
+    /// Returns whether a request should be written to gateway.log.
+    #[must_use]
+    pub fn logs(&self, method: &Method, path: &str) -> bool {
+        !self.silent.matches(method, path)
     }
 }
 
@@ -122,6 +147,7 @@ mod tests {
         RouteRule {
             methods: methods.iter().map(ToString::to_string).collect(),
             path: path.to_owned(),
+            log: true,
         }
     }
 
@@ -154,5 +180,20 @@ mod tests {
         assert!(table.matches(&Method::GET, "/api/tasks/123"));
         assert!(table.matches(&Method::GET, "/api/quota/claude/quota"));
         assert!(!table.matches(&Method::GET, "/api/quota"));
+    }
+
+    #[test]
+    fn route_log_flag_is_independent_from_matching() {
+        let table = RouteTable::compile(RoutesConfig {
+            routes: vec![RouteRule {
+                methods: vec!["GET".to_owned()],
+                path: "/".to_owned(),
+                log: false,
+            }],
+        })
+        .unwrap();
+        assert!(table.matches(&Method::GET, "/"));
+        assert!(!table.logs(&Method::GET, "/"));
+        assert!(table.logs(&Method::GET, "/other"));
     }
 }
