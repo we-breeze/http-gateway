@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use brz_http_gateway::{Gateway, RejectMatched, RouteTable};
+use brz_http_gateway::{Gateway, GatewayConfig, RejectMatched, RouteTable};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -220,4 +220,52 @@ async fn empty_routes_deliver_stream_chunks_before_upstream_finishes() {
     upstream_task.await.unwrap();
     let _ = shutdown.send(());
     gateway_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn gateway_bounds_connections_and_slow_request_heads() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{upstream_address}").parse().unwrap();
+    let gateway = Gateway::new(RouteTable::empty(), RejectMatched, &origin).unwrap();
+    let (shutdown, stopped) = oneshot::channel();
+    let task = tokio::spawn(brz_http_gateway::serve_with_config(
+        listener,
+        gateway,
+        async move {
+            let _ = stopped.await;
+        },
+        Duration::from_secs(1),
+        GatewayConfig {
+            max_connections: 1,
+            header_read_timeout: Duration::from_millis(40),
+            ..GatewayConfig::default()
+        },
+    ));
+
+    let mut first = TcpStream::connect(address).await.unwrap();
+    first.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let mut second = TcpStream::connect(address).await.unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), second.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), first.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }

@@ -21,11 +21,15 @@ pub trait MatchedService: Clone + Send + Sync + 'static {
 pub struct RejectMatched;
 
 impl MatchedService for RejectMatched {
-    async fn call(&self, _request: Request<Incoming>, _peer_addr: SocketAddr) -> GatewayResponse {
-        error_response(
+    fn call(
+        &self,
+        _request: Request<Incoming>,
+        _peer_addr: SocketAddr,
+    ) -> impl Future<Output = GatewayResponse> + Send {
+        std::future::ready(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "matched route has no service implementation",
-        )
+        ))
     }
 }
 
@@ -91,10 +95,59 @@ where
         request: Request<Incoming>,
         peer_addr: SocketAddr,
     ) -> GatewayResponse {
-        if self.routes.matches(request.method(), request.uri().path()) {
+        let matched = self.routes.matches(request.method(), request.uri().path());
+        #[cfg(feature = "gateway-log")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "gateway-log")]
+        let method = request.method().clone();
+        #[cfg(feature = "gateway-log")]
+        let target = request
+            .uri()
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str)
+            .to_owned();
+        #[cfg(feature = "gateway-log")]
+        let request_len = request
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let response = if matched {
             self.matched.call(request, peer_addr).await
         } else {
             self.fallback.forward(request, peer_addr).await
+        };
+        #[cfg(feature = "gateway-log")]
+        {
+            let response_len = response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            tracing::info!(
+                target: "breeze.gateway",
+                "{} {} {} {}ms {} {}",
+                method,
+                target,
+                response.status().as_u16(),
+                started.elapsed().as_millis(),
+                OptionalLength(request_len),
+                OptionalLength(response_len),
+            );
+        }
+        response
+    }
+}
+
+#[cfg(feature = "gateway-log")]
+struct OptionalLength(Option<u64>);
+
+#[cfg(feature = "gateway-log")]
+impl std::fmt::Display for OptionalLength {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(length) => length.fmt(formatter),
+            None => formatter.write_str("-"),
         }
     }
 }
