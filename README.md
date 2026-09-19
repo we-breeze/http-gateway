@@ -44,13 +44,13 @@ Use `serve_with_config` with `GatewayConfig` when an application needs different
 listener limits. Request and response bodies remain streamed rather than being
 buffered or subject to a whole-request timeout.
 
-Enable `gateway-log` to emit access events to `breeze.gateway`. With
-`brz-logs`, they are written to `gateway.log` in positional form with method,
-raw target, status, elapsed time, request length, and response length. Unknown
-lengths use `-`:
+Enable `fallback-log` to emit access events only when a request is forwarded to
+the fallback origin. With `brz-logs`, they are written to `fallback.log` in
+positional form with method, raw target, status, elapsed time, request length,
+and response length. Unknown lengths use `-`:
 
 ```text
-2026-09-19 18:13:02 [GATEWAY] GET /api/quota?q=a 200 102ms - 133
+2026-09-19 18:13:02 [FALLBACK] GET /api/quota?q=a 200 102ms - 133
 ```
 
 ## Crate naming
