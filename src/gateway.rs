@@ -61,7 +61,6 @@ impl MatchedService for OriginService {
 #[derive(Clone)]
 pub struct Gateway<S> {
     routes: RouteTable,
-    log_routes: RouteTable,
     matched: S,
     fallback: FallbackProxy,
 }
@@ -80,25 +79,7 @@ where
         fallback_origin: &Uri,
     ) -> Result<Self, ProxyConfigError> {
         Ok(Self {
-            log_routes: routes.clone(),
             routes,
-            matched,
-            fallback: FallbackProxy::new(fallback_origin)?,
-        })
-    }
-
-    /// Builds a gateway with a separate route table controlling access logs.
-    /// This is useful when dispatch uses an internal catch-all while a
-    /// migration route file supplies per-route `log = false` settings.
-    pub fn new_with_log_routes(
-        routes: RouteTable,
-        log_routes: RouteTable,
-        matched: S,
-        fallback_origin: &Uri,
-    ) -> Result<Self, ProxyConfigError> {
-        Ok(Self {
-            routes,
-            log_routes,
             matched,
             fallback: FallbackProxy::new(fallback_origin)?,
         })
@@ -115,60 +96,56 @@ where
         peer_addr: SocketAddr,
     ) -> GatewayResponse {
         let matched = self.routes.matches(request.method(), request.uri().path());
-        #[cfg(feature = "gateway-log")]
-        let started = std::time::Instant::now();
-        #[cfg(feature = "gateway-log")]
-        let method = request.method().clone();
-        #[cfg(feature = "gateway-log")]
-        let target = request
-            .uri()
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str)
-            .to_owned();
-        #[cfg(feature = "gateway-log")]
-        let request_len = request
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
+        #[cfg(feature = "fallback-log")]
+        let fallback_log = (!matched).then(|| {
+            let target = request
+                .uri()
+                .path_and_query()
+                .map_or("/", http::uri::PathAndQuery::as_str)
+                .to_owned();
+            let request_len = request
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            (
+                std::time::Instant::now(),
+                request.method().clone(),
+                target,
+                request_len,
+            )
+        });
         let response = if matched {
             self.matched.call(request, peer_addr).await
         } else {
             self.fallback.forward(request, peer_addr).await
         };
-        #[cfg(feature = "gateway-log")]
-        {
+        #[cfg(feature = "fallback-log")]
+        if let Some((started, method, target, request_len)) = fallback_log {
             let response_len = response
                 .headers()
                 .get(http::header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok());
-            if self.log_routes.logs(
-                &method,
-                target
-                    .split_once('?')
-                    .map_or(target.as_str(), |(path, _)| path),
-            ) {
-                tracing::info!(
-                    target: "breeze.gateway",
-                    "{} {} {} {}ms {} {}",
-                    method,
-                    target,
-                    response.status().as_u16(),
-                    started.elapsed().as_millis(),
-                    OptionalLength(request_len),
-                    OptionalLength(response_len),
-                );
-            }
+            tracing::info!(
+                target: "breeze.fallback",
+                "{} {} {} {}ms {} {}",
+                method,
+                target,
+                response.status().as_u16(),
+                started.elapsed().as_millis(),
+                OptionalLength(request_len),
+                OptionalLength(response_len),
+            );
         }
         response
     }
 }
 
-#[cfg(feature = "gateway-log")]
+#[cfg(feature = "fallback-log")]
 struct OptionalLength(Option<u64>);
 
-#[cfg(feature = "gateway-log")]
+#[cfg(feature = "fallback-log")]
 impl std::fmt::Display for OptionalLength {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
