@@ -61,6 +61,7 @@ impl MatchedService for OriginService {
 #[derive(Clone)]
 pub struct Gateway<S> {
     routes: RouteTable,
+    log_routes: RouteTable,
     matched: S,
     fallback: FallbackProxy,
 }
@@ -79,7 +80,25 @@ where
         fallback_origin: &Uri,
     ) -> Result<Self, ProxyConfigError> {
         Ok(Self {
+            log_routes: routes.clone(),
             routes,
+            matched,
+            fallback: FallbackProxy::new(fallback_origin)?,
+        })
+    }
+
+    /// Builds a gateway with a separate route table controlling access logs.
+    /// This is useful when dispatch uses an internal catch-all while a
+    /// migration route file supplies per-route `log = false` settings.
+    pub fn new_with_log_routes(
+        routes: RouteTable,
+        log_routes: RouteTable,
+        matched: S,
+        fallback_origin: &Uri,
+    ) -> Result<Self, ProxyConfigError> {
+        Ok(Self {
+            routes,
+            log_routes,
             matched,
             fallback: FallbackProxy::new(fallback_origin)?,
         })
@@ -124,16 +143,23 @@ where
                 .get(http::header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok());
-            tracing::info!(
-                target: "breeze.gateway",
-                "{} {} {} {}ms {} {}",
-                method,
-                target,
-                response.status().as_u16(),
-                started.elapsed().as_millis(),
-                OptionalLength(request_len),
-                OptionalLength(response_len),
-            );
+            if self.log_routes.logs(
+                &method,
+                target
+                    .split_once('?')
+                    .map_or(target.as_str(), |(path, _)| path),
+            ) {
+                tracing::info!(
+                    target: "breeze.gateway",
+                    "{} {} {} {}ms {} {}",
+                    method,
+                    target,
+                    response.status().as_u16(),
+                    started.elapsed().as_millis(),
+                    OptionalLength(request_len),
+                    OptionalLength(response_len),
+                );
+            }
         }
         response
     }
