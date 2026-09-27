@@ -111,6 +111,7 @@ where
     F: Future<Output = ()>,
 {
     config.validate()?;
+    let gateway = Arc::new(gateway);
     let connection_limit = Arc::new(Semaphore::new(config.max_connections));
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
@@ -128,11 +129,11 @@ where
                     warn!(%peer_addr, %error, "failed to configure gateway connection");
                     continue;
                 }
-                let gateway = gateway.clone();
+                let gateway = Arc::clone(&gateway);
                 connections.spawn(async move {
                     let _permit = permit;
                     let service = service_fn(move |request| {
-                        let gateway = gateway.clone();
+                        let gateway = Arc::clone(&gateway);
                         async move {
                             Ok::<_, Infallible>(gateway.handle(request, peer_addr).await)
                         }
