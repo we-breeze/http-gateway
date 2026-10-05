@@ -38,6 +38,32 @@ Only an origin-only `http://` fallback URL is accepted. TLS termination and
 HTTP/2 can be provided by an outer ingress; the local fallback hop remains
 HTTP/1.1 so upgrade tunneling is explicit and deterministic.
 
+## Route exclusions
+
+Use `[[exclude]]` to send matching requests directly to the fallback origin,
+even when an exact or wildcard `[[routes]]` entry selects them:
+
+```toml
+[[exclude]]
+methods = ["GET"]
+path = "/api/events"
+
+[[routes]]
+path = "/api/*path"
+admission = { provider = "recorder", scope = "all-apis", acquire_timeout_ms = 50 }
+```
+
+Exclusions take precedence regardless of configuration order. Excluded requests
+skip the selected service and `try_acquire`, retaining the fallback's streaming
+behavior. In this example, `POST /api/events` remains eligible for recording.
+Exclusions use the same exact paths, `:name` parameters and terminal `*name`
+templates as routes; omitted or empty `methods` means all methods. Matching uses
+only the raw request path, without the query string. Invalid exclusions fail
+configuration loading. Provider registration is still validated for every route.
+
+Rust callers constructing `RoutesConfig` literals can use
+`RoutesConfig { routes, ..RoutesConfig::default() }` when no exclusions are needed.
+
 ## Recording admission
 
 Selected APIs can share non-waiting admission across gateway processes:

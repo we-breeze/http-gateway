@@ -17,7 +17,7 @@ pub use admission::{
     ADMISSION_SCOPE_HEADER, ADMISSION_TOKEN_HEADER, AcquireOutcome, AdmissionError,
     AdmissionFuture, AdmissionProvider, AdmissionRegistry, AdmissionTicket, RegistrationError,
 };
-pub use config::{AdmissionRule, ConfigError, RouteRule, RouteTable, RoutesConfig};
+pub use config::{AdmissionRule, ConfigError, ExclusionRule, RouteRule, RouteTable, RoutesConfig};
 pub use gateway::{Gateway, GatewayBuildError, MatchedService, OriginService, RejectMatched};
 pub use proxy::{BoxError, GatewayBody, GatewayResponse, ProxyConfigError};
 pub use server::{GatewayConfig, bind, serve, serve_with_config};
