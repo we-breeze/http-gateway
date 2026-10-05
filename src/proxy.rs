@@ -20,18 +20,35 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
+mod replay;
+
+/// Applied only after recording admission succeeds. HTTP origins can replay
+/// once on a connection failure before dispatch or an explicit 404 response.
+#[derive(Clone)]
+pub(crate) struct RecordingFallback(pub(crate) FallbackProxy);
+
+/// The HTTP client failed to establish a connection, before request dispatch.
+struct ConnectFailure;
+
 pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type GatewayBody = BoxBody<Bytes, BoxError>;
 pub type GatewayResponse = Response<GatewayBody>;
 
 #[derive(Clone)]
 pub(crate) struct FallbackProxy {
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, GatewayBody>,
     scheme: Scheme,
-    authority: Authority,
+    authority: Option<Authority>,
 }
 
 impl FallbackProxy {
+    pub(crate) fn from_admission() -> Self {
+        Self {
+            client: Client::builder(TokioExecutor::new()).build_http(),
+            scheme: Scheme::HTTP,
+            authority: None,
+        }
+    }
     pub(crate) fn new(upstream: &Uri) -> Result<Self, ProxyConfigError> {
         let scheme = upstream
             .scheme()
@@ -51,43 +68,82 @@ impl FallbackProxy {
         Ok(Self {
             client,
             scheme,
-            authority,
+            authority: Some(authority),
         })
     }
 
     pub(crate) async fn forward(
         &self,
-        mut request: Request<Incoming>,
+        request: Request<Incoming>,
         peer_addr: SocketAddr,
     ) -> GatewayResponse {
+        self.forward_body(
+            request.map(|body| body.map_err(|e| Box::new(e) as BoxError).boxed()),
+            peer_addr,
+        )
+        .await
+    }
+
+    async fn forward_body(
+        &self,
+        mut request: Request<GatewayBody>,
+        peer_addr: SocketAddr,
+    ) -> GatewayResponse {
+        let mut downstream_upgrade =
+            is_upgrade(request.headers()).then(|| hyper::upgrade::on(&mut request));
+        self.try_forward_body(request, peer_addr, &mut downstream_upgrade)
+            .await
+            .unwrap_or_else(|_| upstream_unavailable())
+    }
+
+    async fn try_forward_body(
+        &self,
+        mut request: Request<GatewayBody>,
+        peer_addr: SocketAddr,
+        downstream_upgrade: &mut Option<OnUpgrade>,
+    ) -> Result<GatewayResponse, ConnectFailure> {
+        if self.authority.is_none()
+            && request
+                .extensions()
+                .get::<crate::AdmissionTicket>()
+                .and_then(crate::AdmissionTicket::origin)
+                .is_none()
+        {
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recorder origin is missing",
+            ));
+        }
         let upgrade = is_upgrade(request.headers());
-        let downstream_upgrade = upgrade.then(|| hyper::upgrade::on(&mut request));
         if let Err(error) = self.prepare_request(&mut request, peer_addr, upgrade) {
-            return error_response(StatusCode::BAD_GATEWAY, error.to_string());
+            return Ok(error_response(StatusCode::BAD_GATEWAY, error.to_string()));
         }
 
         let mut response = match self.client.request(request).await {
             Ok(response) => response,
             Err(error) => {
                 debug!(%error, "fallback upstream request failed");
-                return error_response(StatusCode::BAD_GATEWAY, "fallback upstream unavailable");
+                if error.is_connect() {
+                    return Err(ConnectFailure);
+                }
+                return Ok(upstream_unavailable());
             }
         };
 
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-            if let Some(downstream_upgrade) = downstream_upgrade {
+            if let Some(downstream_upgrade) = downstream_upgrade.take() {
                 let upstream_upgrade = hyper::upgrade::on(&mut response);
                 tokio::spawn(tunnel(downstream_upgrade, upstream_upgrade));
             }
         } else {
             remove_hop_by_hop_headers(response.headers_mut(), false);
         }
-        response.map(|body| body.map_err(|error| Box::new(error) as BoxError).boxed())
+        Ok(response.map(|body| body.map_err(|error| Box::new(error) as BoxError).boxed()))
     }
 
-    fn prepare_request(
+    fn prepare_request<B>(
         &self,
-        request: &mut Request<Incoming>,
+        request: &mut Request<B>,
         peer_addr: SocketAddr,
         upgrade: bool,
     ) -> Result<(), http::Error> {
@@ -95,9 +151,17 @@ impl FallbackProxy {
             .uri()
             .path_and_query()
             .map_or("/", http::uri::PathAndQuery::as_str);
+        let authority = request
+            .extensions()
+            .get::<crate::AdmissionTicket>()
+            .and_then(crate::AdmissionTicket::origin)
+            .and_then(Uri::authority)
+            .cloned()
+            .or_else(|| self.authority.clone())
+            .expect("an origin is required before preparing the request");
         *request.uri_mut() = Uri::builder()
             .scheme(self.scheme.clone())
-            .authority(self.authority.clone())
+            .authority(authority)
             .path_and_query(path_and_query)
             .build()?;
 
@@ -111,8 +175,21 @@ impl FallbackProxy {
         if let Some(host) = original_host {
             headers.entry(X_FORWARDED_HOST).or_insert(host);
         }
+        // Connection nominations from the client must not strip the ticket
+        // that this gateway generated after obtaining admission.
+        if let Some(ticket) = request
+            .extensions()
+            .get::<crate::AdmissionTicket>()
+            .cloned()
+        {
+            ticket.attach(request);
+        }
         Ok(())
     }
+}
+
+fn upstream_unavailable() -> GatewayResponse {
+    error_response(StatusCode::BAD_GATEWAY, "fallback upstream unavailable")
 }
 
 fn append_forwarded_for(headers: &mut HeaderMap, address: std::net::IpAddr) {

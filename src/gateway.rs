@@ -1,11 +1,18 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use http::{Request, StatusCode, Uri};
 use hyper::body::Incoming;
 
+use crate::admission::{
+    ADMISSION_SCOPE_HEADER, ADMISSION_TOKEN_HEADER, AcquireOutcome, AdmissionError,
+    AdmissionRegistry,
+};
 use crate::config::RouteTable;
-use crate::proxy::{FallbackProxy, GatewayResponse, ProxyConfigError, error_response};
+use crate::proxy::{
+    FallbackProxy, GatewayResponse, ProxyConfigError, RecordingFallback, error_response,
+};
 
 /// Application service selected by configured route rules.
 pub trait MatchedService: Clone + Send + Sync + 'static {
@@ -40,6 +47,13 @@ pub struct OriginService {
 }
 
 impl OriginService {
+    /// Creates a service whose target must be supplied by an admission ticket.
+    #[must_use]
+    pub fn from_admission() -> Self {
+        Self {
+            proxy: FallbackProxy::from_admission(),
+        }
+    }
     /// Creates a service backed by an origin-only HTTP URL.
     ///
     /// # Errors
@@ -53,7 +67,7 @@ impl OriginService {
 
 impl MatchedService for OriginService {
     async fn call(&self, request: Request<Incoming>, peer_addr: SocketAddr) -> GatewayResponse {
-        self.proxy.forward(request, peer_addr).await
+        self.proxy.forward_recording(request, peer_addr).await
     }
 }
 
@@ -63,6 +77,7 @@ pub struct Gateway<S> {
     routes: RouteTable,
     matched: S,
     fallback: FallbackProxy,
+    admission: AdmissionRegistry,
 }
 
 impl<S> Gateway<S>
@@ -72,16 +87,39 @@ where
     /// Builds a gateway with a validated fallback origin URL.
     ///
     /// # Errors
-    /// Returns an error when the fallback is not an origin-only HTTP URL.
+    /// Returns an error when the fallback is not an origin-only HTTP URL or
+    /// routes reference an admission provider (use `with_admission` to register).
     pub fn new(
         routes: RouteTable,
         matched: S,
         fallback_origin: &Uri,
-    ) -> Result<Self, ProxyConfigError> {
+    ) -> Result<Self, GatewayBuildError> {
+        Self::with_admission(routes, matched, fallback_origin, AdmissionRegistry::new())
+    }
+
+    /// Builds a gateway after validating every configured provider reference.
+    /// Unknown providers are construction errors, including with `new`.
+    pub fn with_admission(
+        routes: RouteTable,
+        matched: S,
+        fallback_origin: &Uri,
+        admission: AdmissionRegistry,
+    ) -> Result<Self, GatewayBuildError> {
+        for (route, rule) in routes.admissions().iter().enumerate() {
+            if let Some(rule) = rule {
+                if admission.get(&rule.provider).is_none() {
+                    return Err(GatewayBuildError::MissingProvider {
+                        route,
+                        provider: rule.provider.clone(),
+                    });
+                }
+            }
+        }
         Ok(Self {
             routes,
             matched,
             fallback: FallbackProxy::new(fallback_origin)?,
+            admission,
         })
     }
 
@@ -92,10 +130,48 @@ where
 
     pub async fn handle(
         &self,
-        request: Request<Incoming>,
+        mut request: Request<Incoming>,
         peer_addr: SocketAddr,
     ) -> GatewayResponse {
-        let matched = self.routes.matches(request.method(), request.uri().path());
+        request.headers_mut().remove(ADMISSION_SCOPE_HEADER);
+        request.headers_mut().remove(ADMISSION_TOKEN_HEADER);
+        request.extensions_mut().remove::<crate::AdmissionTicket>();
+        let selected = self.routes.select(request.method(), request.uri().path());
+        let mut matched = selected.is_some();
+        if let Some(rule) = selected.and_then(|id| self.routes.admissions()[id].as_ref()) {
+            let provider = self
+                .admission
+                .get(&rule.provider)
+                .expect("configured providers were validated at construction");
+            let result = tokio::time::timeout(
+                Duration::from_millis(rule.acquire_timeout_ms),
+                provider.try_acquire(&rule.scope),
+            )
+            .await
+            .unwrap_or(Err(AdmissionError::Timeout));
+            match result {
+                Ok(AcquireOutcome::Acquired(ticket)) if ticket.scope() == rule.scope => {
+                    ticket.attach(&mut request);
+                    request
+                        .extensions_mut()
+                        .insert(RecordingFallback(self.fallback.clone()));
+                }
+                Ok(
+                    AcquireOutcome::Busy
+                    | AcquireOutcome::NoRecorder
+                    | AcquireOutcome::NotParticipant,
+                ) => matched = false,
+                outcome => {
+                    let error = match outcome {
+                        Err(error) => error,
+                        _ => AdmissionError::InvalidTicket,
+                    };
+                    tracing::warn!(provider = %rule.provider, scope = %rule.scope, %error,
+                        "request admission failed before dispatch; using fallback");
+                    matched = false;
+                }
+            }
+        }
         #[cfg(feature = "fallback-log")]
         let fallback_log = (!matched).then(|| {
             let target = request
@@ -140,6 +216,14 @@ where
         }
         response
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayBuildError {
+    #[error(transparent)]
+    Proxy(#[from] ProxyConfigError),
+    #[error("route {route} references an unregistered admission provider: {provider}")]
+    MissingProvider { route: usize, provider: String },
 }
 
 #[cfg(feature = "fallback-log")]

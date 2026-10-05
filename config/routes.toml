@@ -4,3 +4,8 @@ routes = []
 # [[routes]]
 # methods = ["GET"]
 # path = "/api/example"
+# admission = { provider = "recorder", scope = "all-writes", acquire_timeout_ms = 50 }
+# The provider must be registered when constructing the gateway. APIs using
+# the same scope share one slot with the Redis recording provider.
+# Configure GatewayLeaseConfig(instance_id) in the application and publish N
+# to <key_prefix>:max-gateways in Redis to limit participating gateways.
