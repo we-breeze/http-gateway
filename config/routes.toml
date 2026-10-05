@@ -1,6 +1,11 @@
 # An empty route set forwards every request to the fallback origin.
 routes = []
 
+# Exclusions take precedence and send requests directly to the fallback.
+# [[exclude]]
+# methods = ["GET"]
+# path = "/api/events"
+
 # [[routes]]
 # methods = ["GET"]
 # path = "/api/example"
