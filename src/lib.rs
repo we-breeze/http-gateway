@@ -5,12 +5,19 @@
 //! proxied with streaming bodies, repeated headers, cancellation/backpressure,
 //! and HTTP upgrades preserved. An empty route table forwards every request.
 
+mod admission;
 mod config;
 mod gateway;
 mod proxy;
+#[cfg(feature = "redis-recording")]
+pub mod redis_admission;
 mod server;
 
-pub use config::{ConfigError, RouteRule, RouteTable, RoutesConfig};
-pub use gateway::{Gateway, MatchedService, OriginService, RejectMatched};
+pub use admission::{
+    ADMISSION_SCOPE_HEADER, ADMISSION_TOKEN_HEADER, AcquireOutcome, AdmissionError,
+    AdmissionFuture, AdmissionProvider, AdmissionRegistry, AdmissionTicket, RegistrationError,
+};
+pub use config::{AdmissionRule, ConfigError, RouteRule, RouteTable, RoutesConfig};
+pub use gateway::{Gateway, GatewayBuildError, MatchedService, OriginService, RejectMatched};
 pub use proxy::{BoxError, GatewayBody, GatewayResponse, ProxyConfigError};
 pub use server::{GatewayConfig, bind, serve, serve_with_config};
