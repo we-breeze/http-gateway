@@ -29,7 +29,7 @@ async fn read_head(stream: &mut TcpStream) -> String {
     String::from_utf8(head).unwrap()
 }
 
-async fn exercise(admission: bool) {
+async fn exercise(admission: bool, cors: bool) {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", upstream.local_addr().unwrap())
         .parse()
@@ -68,7 +68,12 @@ async fn exercise(admission: bool) {
     registry
         .register("recorder", Provider(Arc::clone(&acquisitions)))
         .unwrap();
-    let gateway = Gateway::with_admission(routes, RejectMatched, &origin, registry).unwrap();
+    let mut gateway = Gateway::with_admission(routes, RejectMatched, &origin, registry).unwrap();
+    if cors {
+        gateway = gateway
+            .with_cors(brz_http_gateway::Cors::permissive())
+            .unwrap();
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address: SocketAddr = listener.local_addr().unwrap();
     let (shutdown, stopped) = oneshot::channel();
@@ -84,13 +89,18 @@ async fn exercise(admission: bool) {
     client
         .write_all(
             b"GET /api/events?cursor=1 HTTP/1.1\r\nHost: public.example\r\n\
-              Connection: close\r\nx-breeze-admission-token: forged\r\n\r\n",
+              Connection: close\r\nOrigin: https://app.example\r\nx-breeze-admission-token: forged\r\n\r\n",
         )
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         let head = read_head(&mut client).await;
         assert!(head.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            head.to_ascii_lowercase()
+                .contains("access-control-allow-origin: *"),
+            cors
+        );
         assert!(
             head.to_ascii_lowercase()
                 .contains("content-type: text/event-stream")
@@ -112,8 +122,10 @@ async fn exercise(admission: bool) {
 
 #[tokio::test]
 async fn excluded_requests_stream_without_calling_admission_or_the_selected_service() {
-    exercise(true).await;
-    exercise(false).await;
+    exercise(true, false).await;
+    exercise(false, false).await;
+    exercise(true, true).await;
+    exercise(false, true).await;
 }
 
 #[test]

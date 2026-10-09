@@ -1,5 +1,41 @@
 # Breeze HTTP Gateway
 
+## Application-wide CORS
+
+CORS is disabled by default. Enable it on the gateway to handle preflights
+before business route selection and recording admission:
+
+```rust,ignore
+use brz_http_gateway::{Cors, Gateway};
+
+let mut cors = Cors::permissive();
+cors.allow_credentials = true;
+cors.expose_headers = vec!["Content-Disposition".into(), "X-Request-ID".into()];
+let gateway = Gateway::new(routes, api, &python_upstream)?.with_cors(cors)?;
+```
+
+OPTIONS requests with Origin and Access-Control-Request-Method are answered
+locally. They need no OPTIONS route entry or business handler, work with an
+empty route table and unavailable origins, and do not acquire recording slots
+or reach either upstream. This also means downstream Recorders will not capture
+those preflights. Ordinary OPTIONS and actual business requests keep their normal
+routing. A denied preflight returns 400; a permitted one returns 200 with `OK`.
+
+The gateway applies the same policy to matched responses, fallback responses,
+and gateway error responses, without buffering response bodies. It replaces
+upstream CORS fields and preserves other headers, including repeated Set-Cookie
+and existing Vary values. Configure CORS once at the public boundary; inner
+servers can leave CORS disabled.
+
+Method names and their order are explicit and configurable, including QUERY.
+The application supplies its policy; enabling CORS does not discover business
+routes or change which methods a handler accepts.
+
+The shared policy is a pinned registry dependency; a sibling checkout is not
+required to build or publish this package.
+
+## Overview
+
 `brz-http-gateway` is a reusable HTTP/1.1 migration gateway. Typed route rules
 select requests for an application service; every unmatched request is streamed
 to a fallback origin. Ordinary proxy paths preserve request and response streaming,

@@ -34,9 +34,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "brz-http-cors"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de66d8ce67cbc3157b9b96a70602f114612421b30a4b75f9596f0210352430ba"
+dependencies = [
+ "http",
+]
+
+[[package]]
 name = "brz-http-gateway"
 version = "0.2.0"
 dependencies = [
+ "brz-http-cors",
  "brz-http-router",
  "brz-redis",
  "bytes",

@@ -78,6 +78,7 @@ pub struct Gateway<S> {
     matched: S,
     fallback: FallbackProxy,
     admission: AdmissionRegistry,
+    cors: Option<crate::Cors>,
 }
 
 impl<S> Gateway<S>
@@ -120,7 +121,23 @@ where
             matched,
             fallback: FallbackProxy::new(fallback_origin)?,
             admission,
+            cors: None,
         })
+    }
+
+    /// Enables application-wide CORS before route selection and admission.
+    /// Preflights are answered locally, including for paths absent from the
+    /// route table; they do not reach recording admission or either origin.
+    /// Ordinary OPTIONS requests keep their normal routing behavior.
+    ///
+    /// # Errors
+    /// Returns an error when the policy contains invalid header or method values.
+    pub fn with_cors(mut self, cors: crate::Cors) -> Result<Self, GatewayBuildError> {
+        if !cors.validate() {
+            return Err(GatewayBuildError::InvalidCorsPolicy);
+        }
+        self.cors = Some(cors);
+        Ok(self)
     }
 
     #[must_use]
@@ -136,6 +153,18 @@ where
         request.headers_mut().remove(ADMISSION_SCOPE_HEADER);
         request.headers_mut().remove(ADMISSION_TOKEN_HEADER);
         request.extensions_mut().remove::<crate::AdmissionTicket>();
+        if let Some(response) = self
+            .cors
+            .as_ref()
+            .and_then(|cors| crate::cors::preflight(cors, &request))
+        {
+            return response;
+        }
+        let origin = self
+            .cors
+            .as_ref()
+            .and_then(|_| request.headers().get(http::header::ORIGIN))
+            .cloned();
         let selected = self.routes.select(request.method(), request.uri().path());
         let mut matched = selected.is_some();
         if let Some(rule) = selected.and_then(|id| self.routes.admissions()[id].as_ref()) {
@@ -191,11 +220,17 @@ where
                 request_len,
             )
         });
-        let response = if matched {
+        let mut response = if matched {
             self.matched.call(request, peer_addr).await
         } else {
             self.fallback.forward(request, peer_addr).await
         };
+        if let Some(cors) = &self.cors {
+            cors.apply(
+                origin.as_ref().map(http::HeaderValue::as_bytes),
+                response.headers_mut(),
+            );
+        }
         #[cfg(feature = "fallback-log")]
         if let Some((started, method, target, request_len)) = fallback_log {
             let response_len = response
@@ -220,6 +255,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayBuildError {
+    #[error("invalid CORS policy")]
+    InvalidCorsPolicy,
     #[error(transparent)]
     Proxy(#[from] ProxyConfigError),
     #[error("route {route} references an unregistered admission provider: {provider}")]
