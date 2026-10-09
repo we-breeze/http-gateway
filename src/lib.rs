@@ -7,6 +7,7 @@
 
 mod admission;
 mod config;
+mod cors;
 mod gateway;
 mod proxy;
 #[cfg(feature = "redis-recording")]
@@ -17,6 +18,7 @@ pub use admission::{
     ADMISSION_SCOPE_HEADER, ADMISSION_TOKEN_HEADER, AcquireOutcome, AdmissionError,
     AdmissionFuture, AdmissionProvider, AdmissionRegistry, AdmissionTicket, RegistrationError,
 };
+pub use brz_http_cors::Cors;
 pub use config::{AdmissionRule, ConfigError, ExclusionRule, RouteRule, RouteTable, RoutesConfig};
 pub use gateway::{Gateway, GatewayBuildError, MatchedService, OriginService, RejectMatched};
 pub use proxy::{BoxError, GatewayBody, GatewayResponse, ProxyConfigError};
