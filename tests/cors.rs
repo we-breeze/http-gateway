@@ -229,6 +229,49 @@ async fn ordinary_options_and_get_keep_business_routing_and_response_bodies() {
 }
 
 #[tokio::test]
+async fn responses_without_origin_merge_vary_only_when_cors_is_enabled() {
+    for enabled in [true, false] {
+        let selected = Selected::default();
+        let mut gateway = Gateway::new(
+            routes("[[routes]]\npath = \"/api/apps/installed\""),
+            selected.clone(),
+            &unavailable(),
+        )
+        .unwrap();
+        if enabled {
+            gateway = gateway.with_cors(policy()).unwrap();
+        }
+        let response = request(gateway, "GET /api/apps/installed HTTP/1.1").await;
+        assert!(response.starts_with("HTTP/1.1 202"));
+        assert!(response.ends_with("selected"));
+        assert_eq!(selected.0.load(Ordering::SeqCst), 1);
+        let expected = if enabled {
+            vec!["Accept-Encoding", "Origin"]
+        } else {
+            vec!["Accept-Encoding"]
+        };
+        assert_eq!(values(&response, "vary"), expected);
+        assert_eq!(values(&response, "set-cookie"), ["a=1", "b=2"]);
+        assert!(values(&response, "access-control-allow-credentials").is_empty());
+        assert!(values(&response, "access-control-expose-headers").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn fallback_errors_without_origin_still_vary() {
+    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &unavailable())
+        .unwrap()
+        .with_cors(policy())
+        .unwrap();
+    let response = request(gateway, "GET /api/apps/installed HTTP/1.1").await;
+    assert!(response.starts_with("HTTP/1.1 502"));
+    assert_eq!(values(&response, "vary"), ["Origin"]);
+    assert!(values(&response, "access-control-allow-origin").is_empty());
+    assert!(values(&response, "access-control-allow-credentials").is_empty());
+    assert!(values(&response, "access-control-expose-headers").is_empty());
+}
+
+#[tokio::test]
 async fn fallback_errors_also_receive_cors_headers() {
     let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &unavailable())
         .unwrap()
@@ -248,43 +291,49 @@ async fn fallback_errors_also_receive_cors_headers() {
 
 #[tokio::test]
 async fn python_fallback_responses_use_the_outer_policy() {
-    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", upstream.local_addr().unwrap())
-        .parse()
-        .unwrap();
-    let task = tokio::spawn(async move {
-        let (mut stream, _) = upstream.accept().await.unwrap();
-        let mut head = Vec::new();
-        while !head.ends_with(b"\r\n\r\n") {
-            head.push(stream.read_u8().await.unwrap());
-        }
-        assert!(head.starts_with(b"GET /python HTTP/1.1"));
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\
+    for origin_header in ["", "\r\nOrigin: https://app.example"] {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", upstream.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(b"GET /python HTTP/1.1"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\
             Access-Control-Allow-Origin: *\r\nVary: Accept-Encoding\r\n\
             Set-Cookie: a=1\r\nSet-Cookie: b=2\r\nConnection: close\r\n\r\npython",
-            )
-            .await
+                )
+                .await
+                .unwrap();
+        });
+        let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &origin)
+            .unwrap()
+            .with_cors(policy())
             .unwrap();
-    });
-    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &origin)
-        .unwrap()
-        .with_cors(policy())
-        .unwrap();
-    let response = request(
-        gateway,
-        "GET /python HTTP/1.1\r\nOrigin: https://app.example",
-    )
-    .await;
-    task.await.unwrap();
-    assert!(response.ends_with("python"));
-    assert_eq!(
-        values(&response, "access-control-allow-origin"),
-        ["https://app.example"]
-    );
-    assert_eq!(values(&response, "vary"), ["Accept-Encoding", "Origin"]);
-    assert_eq!(values(&response, "set-cookie"), ["a=1", "b=2"]);
+        let response = request(gateway, &format!("GET /python HTTP/1.1{origin_header}")).await;
+        task.await.unwrap();
+        assert!(response.ends_with("python"));
+        assert_eq!(
+            values(&response, "access-control-allow-origin"),
+            [if origin_header.is_empty() {
+                "*"
+            } else {
+                "https://app.example"
+            }]
+        );
+        assert_eq!(values(&response, "vary"), ["Accept-Encoding", "Origin"]);
+        assert_eq!(values(&response, "set-cookie"), ["a=1", "b=2"]);
+        if origin_header.is_empty() {
+            assert!(values(&response, "access-control-allow-credentials").is_empty());
+            assert!(values(&response, "access-control-expose-headers").is_empty());
+        }
+    }
 }
 
 #[test]
