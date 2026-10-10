@@ -35,9 +35,9 @@ dependencies = [
 
 [[package]]
 name = "brz-http-cors"
-version = "0.0.2"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8befe228f7560c48d95e18592b9d4d90772c75792c7a8ab4e619bb3a4612ace5"
+checksum = "2b1e597207f0267895ce54532e97305078f4d21c4ca00d4d144863f9ba4a526e"
 dependencies = [
  "http",
 ]
