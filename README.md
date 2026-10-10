@@ -11,6 +11,8 @@ use brz_http_gateway::{Cors, Gateway};
 let mut cors = Cors::permissive();
 cors.allow_credentials = true;
 cors.expose_headers = vec!["Content-Disposition".into(), "X-Request-ID".into()];
+// Optional application-specific request headers that affect preflight caching.
+cors.extra_preflight_vary = vec!["X-Preflight-Variant".into()];
 let gateway = Gateway::new(routes, api, &python_upstream)?.with_cors(cors)?;
 ```
 
@@ -20,6 +22,11 @@ empty route table and unavailable origins, and do not acquire recording slots
 or reach either upstream. This also means downstream Recorders will not capture
 those preflights. Ordinary OPTIONS and actual business requests keep their normal
 routing. A denied preflight returns 400; a permitted one returns 200 with `OK`.
+Preflight responses omit Access-Control-Expose-Headers and vary by request
+method/header names, plus Origin when reflected. Additional Vary members can
+be configured with `extra_preflight_vary`; they grant no extension permissions.
+Actual responses use `expose_headers` and do not inherit preflight-only Vary
+members.
 
 The gateway applies the same policy to matched responses, fallback responses,
 and gateway error responses, without buffering response bodies. It replaces

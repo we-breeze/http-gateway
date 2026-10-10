@@ -50,6 +50,7 @@ fn policy() -> Cors {
         allow_origins: vec!["https://app.example".into()],
         allow_credentials: true,
         expose_headers: vec!["X-Request-ID".into()],
+        extra_preflight_vary: vec!["X-Preflight-Variant".into()],
         ..Cors::permissive()
     }
 }
@@ -133,6 +134,13 @@ async fn preflight_succeeds_without_routes_or_a_live_upstream() {
         ["authorization,content-type,x-request-id"]
     );
     assert_eq!(selected.0.load(Ordering::SeqCst), 0);
+    assert!(values(&response, "access-control-expose-headers").is_empty());
+    assert_eq!(
+        values(&response, "vary"),
+        [
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, X-Preflight-Variant"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -170,6 +178,13 @@ async fn disallowed_preflight_is_rejected_locally() {
         assert!(response.starts_with("HTTP/1.1 400"));
         assert!(response.ends_with("Disallowed CORS request"));
         assert_eq!(selected.0.load(Ordering::SeqCst), 0);
+        assert!(values(&response, "access-control-expose-headers").is_empty());
+        assert_eq!(
+            values(&response, "vary"),
+            [
+                "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, X-Preflight-Variant"
+            ]
+        );
     }
 }
 
@@ -205,6 +220,10 @@ async fn ordinary_options_and_get_keep_business_routing_and_response_bodies() {
             ["https://app.example"]
         );
         assert_eq!(values(&response, "vary"), ["Accept-Encoding", "Origin"]);
+        assert_eq!(
+            values(&response, "access-control-expose-headers"),
+            ["X-Request-ID"]
+        );
         assert_eq!(values(&response, "set-cookie"), ["a=1", "b=2"]);
     }
 }
