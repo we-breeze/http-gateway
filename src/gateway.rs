@@ -44,6 +44,7 @@ impl MatchedService for RejectMatched {
 #[derive(Clone)]
 pub struct OriginService {
     proxy: FallbackProxy,
+    response_cors: bool,
 }
 
 impl OriginService {
@@ -52,6 +53,7 @@ impl OriginService {
     pub fn from_admission() -> Self {
         Self {
             proxy: FallbackProxy::from_admission(),
+            response_cors: false,
         }
     }
     /// Creates a service backed by an origin-only HTTP URL.
@@ -61,13 +63,28 @@ impl OriginService {
     pub fn new(origin: &Uri) -> Result<Self, ProxyConfigError> {
         Ok(Self {
             proxy: FallbackProxy::new(origin)?,
+            response_cors: false,
         })
+    }
+
+    /// Trust explicit response CORS decisions from this controlled internal
+    /// origin. Reserved metadata is consumed before public delivery. Ordinary
+    /// fallback origins and client request headers never choose this policy.
+    #[must_use]
+    pub fn with_response_cors(mut self) -> Self {
+        self.response_cors = true;
+        self
     }
 }
 
 impl MatchedService for OriginService {
     async fn call(&self, request: Request<Incoming>, peer_addr: SocketAddr) -> GatewayResponse {
-        self.proxy.forward_recording(request, peer_addr).await
+        let mut response = self.proxy.forward_recording(request, peer_addr).await;
+        let policy = crate::ResponseCors::take_from_headers(response.headers_mut());
+        if self.response_cors {
+            response.extensions_mut().insert(policy);
+        }
+        response
     }
 }
 
@@ -153,6 +170,9 @@ where
         request.headers_mut().remove(ADMISSION_SCOPE_HEADER);
         request.headers_mut().remove(ADMISSION_TOKEN_HEADER);
         request.extensions_mut().remove::<crate::AdmissionTicket>();
+        request
+            .headers_mut()
+            .remove(brz_http_cors::RESPONSE_CORS_HEADER);
         if let Some(response) = self
             .cors
             .as_ref()
@@ -225,10 +245,13 @@ where
         } else {
             self.fallback.forward(request, peer_addr).await
         };
+        // Never expose internal response controls, including from untrusted
+        // fallback origins and when the public boundary has CORS disabled.
+        crate::ResponseCors::take_from_headers(response.headers_mut());
         if let Some(cors) = &self.cors {
-            cors.apply(
+            cors.apply_response(
                 origin.as_ref().map(http::HeaderValue::as_bytes),
-                response.headers_mut(),
+                &mut response,
             );
         }
         #[cfg(feature = "fallback-log")]

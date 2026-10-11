@@ -34,6 +34,39 @@ upstream CORS fields and preserves other headers, including repeated Set-Cookie
 and existing Vary values. Configure CORS once at the public boundary; inner
 servers can leave CORS disabled.
 
+### Response-local decisions and trusted HTTP origins
+
+An in-process `MatchedService` can insert `ResponseCors::Skip` in its response
+extensions to preserve its headers without applying CORS or adding Vary: Origin.
+A status code alone never disables the boundary policy: ordinary business 500
+responses still receive CORS. Preflights continue to run before dispatch.
+
+For a separate controlled internal HTTP server, opt in on both ends:
+
+```rust,ignore
+// Internal brz-http-server listener (not the public listener).
+let config = brz_http_server::ServerConfig {
+    export_cors_policy: true,
+    ..Default::default()
+};
+// Explicitly rendered outside the application's normal CORS boundary.
+let response = brz_http_server::Response::empty(http::StatusCode::INTERNAL_SERVER_ERROR)
+    .without_cors();
+// Matched gateway origin; normal fallback origins remain untrusted.
+let api = brz_http_gateway::OriginService::new(&internal_origin)?.with_response_cors();
+```
+
+The server exports `x-breeze-response-cors: skip` only when configured, and the
+selected `OriginService` converts it into an in-memory response decision only
+when explicitly trusted. One exact `skip` is required; invalid or repeated
+values retain ordinary CORS. In-memory extensions cannot cross HTTP by themselves.
+The gateway removes the reserved header from client requests and every public
+response, including fallback responses and responses when CORS is disabled.
+No status/body inspection, body buffering, route-specific exceptions, or client
+request controls are involved. Leave trust/export disabled for public or
+uncontrolled origins. Existing response headers, cookies and streaming remain
+intact when skipping the policy.
+
 Method names and their order are explicit and configurable, including QUERY.
 The application supplies its policy; enabling CORS does not discover business
 routes or change which methods a handler accepts.
