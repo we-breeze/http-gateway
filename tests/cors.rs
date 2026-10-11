@@ -12,7 +12,7 @@ use http::{Request, Response, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::oneshot;
 
 #[derive(Clone, Default)]
@@ -55,11 +55,15 @@ fn policy() -> Cors {
     }
 }
 
-fn unavailable() -> Uri {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    format!("http://{}", listener.local_addr().unwrap())
+fn unavailable() -> (Uri, TcpSocket) {
+    // Keep the port reserved without listening, so a parallel test cannot
+    // turn this connection-refused fixture into an unrelated live origin.
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let origin = format!("http://{}", socket.local_addr().unwrap())
         .parse()
-        .unwrap()
+        .unwrap();
+    (origin, socket)
 }
 
 fn routes(config: &str) -> RouteTable {
@@ -113,8 +117,9 @@ const PREFLIGHT: &str = "OPTIONS /api/apps/installed HTTP/1.1\r\n\
 
 #[tokio::test]
 async fn preflight_succeeds_without_routes_or_a_live_upstream() {
+    let (origin, _reservation) = unavailable();
     let selected = Selected::default();
-    let gateway = Gateway::new(RouteTable::empty(), selected.clone(), &unavailable())
+    let gateway = Gateway::new(RouteTable::empty(), selected.clone(), &origin)
         .unwrap()
         .with_cors(policy())
         .unwrap();
@@ -145,6 +150,7 @@ async fn preflight_succeeds_without_routes_or_a_live_upstream() {
 
 #[tokio::test]
 async fn preflight_does_not_call_admission_or_the_matched_service() {
+    let (origin, _reservation) = unavailable();
     let acquisitions = Arc::new(AtomicUsize::new(0));
     let mut admission = AdmissionRegistry::new();
     admission
@@ -153,7 +159,7 @@ async fn preflight_does_not_call_admission_or_the_matched_service() {
     let selected = Selected::default();
     let gateway = Gateway::with_admission(routes(
         "[[routes]]\npath = \"/api/*path\"\nadmission = { provider = \"recorder\", scope = \"all\" }"
-    ), selected.clone(), &unavailable(), admission).unwrap().with_cors(policy()).unwrap();
+    ), selected.clone(), &origin, admission).unwrap().with_cors(policy()).unwrap();
     assert!(
         request(gateway, PREFLIGHT)
             .await
@@ -165,12 +171,13 @@ async fn preflight_does_not_call_admission_or_the_matched_service() {
 
 #[tokio::test]
 async fn disallowed_preflight_is_rejected_locally() {
+    let (origin, _reservation) = unavailable();
     for head in [
         PREFLIGHT.replace("https://app.example", "https://other.example"),
         PREFLIGHT.replace("Method: GET", "Method: QUERY"),
     ] {
         let selected = Selected::default();
-        let gateway = Gateway::new(RouteTable::empty(), selected.clone(), &unavailable())
+        let gateway = Gateway::new(RouteTable::empty(), selected.clone(), &origin)
             .unwrap()
             .with_cors(policy())
             .unwrap();
@@ -190,7 +197,8 @@ async fn disallowed_preflight_is_rejected_locally() {
 
 #[tokio::test]
 async fn disabled_cors_preserves_fallback_behavior() {
-    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &unavailable()).unwrap();
+    let (origin, _reservation) = unavailable();
+    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &origin).unwrap();
     let response = request(gateway, PREFLIGHT).await;
     assert!(response.starts_with("HTTP/1.1 502"));
     assert!(values(&response, "access-control-allow-origin").is_empty());
@@ -198,6 +206,7 @@ async fn disabled_cors_preserves_fallback_behavior() {
 
 #[tokio::test]
 async fn ordinary_options_and_get_keep_business_routing_and_response_bodies() {
+    let (origin, _reservation) = unavailable();
     for head in [
         "OPTIONS /api/apps/installed HTTP/1.1\r\nOrigin: https://app.example",
         "GET /api/apps/installed HTTP/1.1\r\nOrigin: https://app.example\r\nAccess-Control-Request-Method: GET",
@@ -206,7 +215,7 @@ async fn ordinary_options_and_get_keep_business_routing_and_response_bodies() {
         let gateway = Gateway::new(
             routes("[[routes]]\npath = \"/api/apps/installed\""),
             selected.clone(),
-            &unavailable(),
+            &origin,
         )
         .unwrap()
         .with_cors(policy())
@@ -230,12 +239,13 @@ async fn ordinary_options_and_get_keep_business_routing_and_response_bodies() {
 
 #[tokio::test]
 async fn responses_without_origin_merge_vary_only_when_cors_is_enabled() {
+    let (origin, _reservation) = unavailable();
     for enabled in [true, false] {
         let selected = Selected::default();
         let mut gateway = Gateway::new(
             routes("[[routes]]\npath = \"/api/apps/installed\""),
             selected.clone(),
-            &unavailable(),
+            &origin,
         )
         .unwrap();
         if enabled {
@@ -259,7 +269,8 @@ async fn responses_without_origin_merge_vary_only_when_cors_is_enabled() {
 
 #[tokio::test]
 async fn fallback_errors_without_origin_still_vary() {
-    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &unavailable())
+    let (origin, _reservation) = unavailable();
+    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &origin)
         .unwrap()
         .with_cors(policy())
         .unwrap();
@@ -273,7 +284,8 @@ async fn fallback_errors_without_origin_still_vary() {
 
 #[tokio::test]
 async fn fallback_errors_also_receive_cors_headers() {
-    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &unavailable())
+    let (origin, _reservation) = unavailable();
+    let gateway = Gateway::new(RouteTable::empty(), Selected::default(), &origin)
         .unwrap()
         .with_cors(policy())
         .unwrap();
@@ -338,12 +350,13 @@ async fn python_fallback_responses_use_the_outer_policy() {
 
 #[test]
 fn invalid_policy_fails_at_gateway_construction() {
+    let (origin, _reservation) = unavailable();
     let cors = Cors {
         allow_origins: vec!["invalid\r\norigin".into()],
         ..policy()
     };
     assert!(matches!(
-        Gateway::new(RouteTable::empty(), Selected::default(), &unavailable())
+        Gateway::new(RouteTable::empty(), Selected::default(), &origin)
             .unwrap()
             .with_cors(cors),
         Err(GatewayBuildError::InvalidCorsPolicy)
