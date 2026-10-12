@@ -11,7 +11,7 @@ repository = "https://github.com/we-breeze/http-gateway"
 brz-http-cors = "=0.0.4"
 bytes = "1"
 brz-http-router = "=0.1.2"
-brz-redis = { version = "0.0.10", optional = true }
+brz-redis = { version = "0.0.11", optional = true }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
@@ -25,7 +25,7 @@ tracing = "0.1"
 rand = { version = "0.8", optional = true }
 
 [dev-dependencies]
-brz-http-server = "=0.0.27"
+brz-http-server = "=0.0.28"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [features]
