@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "brz-http-gateway"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "brz-http-cors",
  "brz-http-router",
@@ -78,9 +78,9 @@ dependencies = [
 
 [[package]]
 name = "brz-http-server"
-version = "0.0.28"
+version = "0.0.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "436d7377f5cc5126eee4c3c1fa267c66584505bc9aac5ad6881f89de16637453"
+checksum = "f5d65d41c9c650caaaea1de08c4258a1ffcf79555087077160d37dacd468fee1"
 dependencies = [
  "brz-ds",
  "brz-http-cors",
@@ -157,9 +157,9 @@ dependencies = [
 
 [[package]]
 name = "brz-redis"
-version = "0.0.11"
+version = "0.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fdfed5b988b46787b494c798203a43d6feaff7df9d73b6085e51895f16f7df7"
+checksum = "b410ebfd429c2422b3f40b47489f72950492ea0a95632e4e2b624e2dc0bc8fec"
 dependencies = [
  "arc-swap",
  "brz-net",
