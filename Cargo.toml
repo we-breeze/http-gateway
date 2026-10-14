@@ -1,6 +1,6 @@
 [package]
 name = "brz-http-gateway"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.85"
 description = "Route-selective HTTP/1.1 gateway with streaming and upgrade fallback"
@@ -11,7 +11,7 @@ repository = "https://github.com/we-breeze/http-gateway"
 brz-http-cors = "=0.0.4"
 bytes = "1"
 brz-http-router = "=0.1.2"
-brz-redis = { version = "=0.0.12", optional = true }
+brz-redis = { version = "=0.0.13", optional = true }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
