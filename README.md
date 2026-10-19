@@ -266,7 +266,7 @@ participation keys can briefly remain during shrinking or TTL recovery:
 | `recording:orders:url` (configurable) | Plain HTTP origin, or JSON `{"url":"http://10.0.0.12:9001","owner":"<boot token>"}` | Managed by the address publisher |
 | `recording:orders:max-gateways` | Decimal N, e.g. `2` | Configuration, no default TTL |
 | `recording:orders:gateway:0` through `:gateway:N-1` | `<instance-id>:<32 hex boot token>` | 30 seconds, renewed |
-| `recording:orders:inflight:all-writes` | `<64 hex request token>` | 60 seconds |
+| `recording:orders:inflight:all-writes` | `<64 hex request token>` | 60 seconds, receiver can renew |
 
 Publish the recorder's origin-only HTTP URL and global participation limit:
 
@@ -310,11 +310,19 @@ business recorder does not need to know the originating gateway or Redis.
 when the receiving adapter requires it.
 
 `RedisAdmissionProvider::with_ttl` can override the default 60 second request
-TTL. There is no request-slot renewal: a case exceeding TTL can overlap the
-next admitted request. The recorder retains its local single-case admission
-check. If no completion callback runs, including a rejected recording request,
-the request slot is recovered by TTL. This crate supplies the provider and
-completion API; integration into `traffic-e2e` remains application-owned.
+TTL. The receiver can call `provider.renew(&ticket)` to atomically extend its
+current reservation by that configured TTL, scheduling renewal before expiry
+(for example every `provider.reservation_ttl() / 3`) until the case and dependencies
+finish. It returns false for an expired, missing, or replaced token and never
+recreates the slot.
+Redis failures remain errors; a receiver that loses ownership must stop accepting
+new case work and retain its local single-case guard until its old work stops.
+Renewal does not depend on gateway participation or recorder discovery.
+Without renewal, a case exceeding TTL can overlap a newly admitted request, so
+the recorder must always retain its local single-case admission check. If no
+completion callback runs, including a rejected recording request, the request
+slot is recovered by TTL. Scheduling and integration into `traffic-e2e` remain
+application-owned.
 
 Validation:
 
@@ -333,6 +341,12 @@ Use `serve_with_config` with `GatewayConfig` when an application needs different
 listener limits. Ordinary proxy requests and all responses remain streamed
 without a whole-request timeout; acquired recording requests buffer their body
 to support the connection-failure and explicit 404 retries described above.
+Proxied upgrade tunnels keep their accepting connection's permit until both
+sides finish. They participate in `shutdown_grace`; after the grace period,
+the server cancels the tunnel and closes both sockets. Cancelling the server
+future also cancels its proxy tunnels. Applications calling `Gateway::handle`
+from their own listener retain responsibility for that listener's resource and
+shutdown management.
 
 Enable `fallback-log` to emit access events only when a request is forwarded to
 the fallback origin. With `brz-logs`, they are written to `fallback.log` in

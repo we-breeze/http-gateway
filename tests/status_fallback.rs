@@ -200,6 +200,7 @@ async fn recording_connect_failure_preserves_the_fallback_upgrade_tunnel() {
         stream.read_exact(&mut message).await.unwrap();
         assert_eq!(&message, b"ping");
         stream.write_all(b"pong").await.unwrap();
+        assert_eq!(stream.read(&mut message).await.unwrap(), 0);
     });
     let routes: RoutesConfig = toml::from_str(
         r#"[[routes]]
@@ -226,7 +227,7 @@ async fn recording_connect_failure_preserves_the_fallback_upgrade_tunnel() {
         async move {
             let _ = stopped.await;
         },
-        Duration::from_secs(1),
+        Duration::from_millis(100),
     ));
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut stream = TcpStream::connect(address).await.unwrap();
@@ -236,9 +237,10 @@ async fn recording_connect_failure_preserves_the_fallback_upgrade_tunnel() {
         let mut message = [0; 4];
         stream.read_exact(&mut message).await.unwrap();
         assert_eq!(&message, b"pong");
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(stream.read(&mut message).await.unwrap(), 0);
         original_task.await.unwrap();
     }).await.unwrap();
-    stop.send(()).unwrap();
-    task.await.unwrap().unwrap();
     drop(recorder);
 }

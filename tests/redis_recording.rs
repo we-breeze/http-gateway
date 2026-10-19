@@ -59,6 +59,8 @@ macro_rules! redis_test {
 redis_test!(
     independent_clients_share_one_slot_and_recorder_owns_completion,
     expiry_recovers_a_slot_and_stale_completion_cannot_release_new_owner,
+    reservation_renewal_uses_configured_ttl_and_never_recreates_or_extends_other_owners,
+    reservation_renewal_passes_token_and_ttl_to_the_writer,
     discovery_controls_admission_and_default_ttl_is_sixty_seconds,
     redis_errors_propagate_as_errors_not_busy,
     malformed_redis_replies_are_errors_not_busy,
@@ -84,6 +86,70 @@ redis_test!(
 
 mod cases {
     use super::*;
+
+    pub async fn reservation_renewal_uses_configured_ttl_and_never_recreates_or_extends_other_owners()
+     {
+        let prefix = prefix();
+        let Some(provider) = provider(&prefix, Duration::from_secs(5)).await else {
+            return;
+        };
+        let redis = RedisService::single(std::env::var("BREEZE_REDIS_TEST_ENDPOINT").unwrap())
+            .await
+            .unwrap();
+        let ticket = acquire(&provider, "writes").await;
+        let key = format!("{prefix}:inflight:writes");
+        let mut shorten = cmd("PEXPIRE");
+        shorten.arg(&key).arg(1000);
+        assert_eq!(redis.command::<i64>(shorten).await.unwrap(), 1);
+        assert!(provider.renew(&ticket).await.unwrap());
+        let mut ttl = cmd("PTTL");
+        ttl.arg(&key);
+        assert!(redis.command::<i64>(ttl).await.unwrap() > 4000);
+
+        assert!(provider.complete(&ticket).await.unwrap());
+        assert!(!provider.renew(&ticket).await.unwrap());
+        assert!(!redis.exists(&key).await.unwrap());
+        let next = acquire(&provider, "writes").await;
+        let mut shorten = cmd("PEXPIRE");
+        shorten.arg(&key).arg(1000);
+        redis.command::<i64>(shorten).await.unwrap();
+        assert!(!provider.renew(&ticket).await.unwrap());
+        let mut ttl = cmd("PTTL");
+        ttl.arg(&key);
+        assert!((1..=1000).contains(&redis.command::<i64>(ttl).await.unwrap()));
+        assert!(provider.owns(&next).await.unwrap());
+        assert!(provider.complete(&next).await.unwrap());
+    }
+
+    pub async fn reservation_renewal_passes_token_and_ttl_to_the_writer() {
+        let (redis, fixture) = command_fixture(|args| {
+            assert_eq!(args[0], b"EVAL");
+            let script = std::str::from_utf8(&args[1]).unwrap();
+            assert!(script.contains("redis.call('GET', KEYS[1]) == ARGV[1]"));
+            assert!(script.contains("redis.call('PEXPIRE', KEYS[1], ARGV[2])"));
+            assert_eq!(args[2], b"1");
+            assert_eq!(args[3], b"renewal-test:inflight:writes");
+            assert_eq!(args[4], b"current-token");
+            assert_eq!(args[5], b"12345");
+            Some(b":1\r\n".to_vec())
+        })
+        .await;
+        let provider = RedisAdmissionProvider::with_ttl(
+            redis,
+            "renewal-test",
+            "recorder-url",
+            Duration::from_millis(12_345),
+        )
+        .unwrap();
+        assert_eq!(provider.reservation_ttl(), Duration::from_millis(12_345));
+        assert_eq!(
+            provider.clone().reservation_ttl(),
+            provider.reservation_ttl()
+        );
+        let ticket = AdmissionTicket::new("writes", "current-token").unwrap();
+        assert!(provider.renew(&ticket).await.unwrap());
+        fixture.abort();
+    }
 
     pub async fn registration_is_exclusive_and_owned_renewal_preserves_replacement() {
         let prefix = prefix();
@@ -412,7 +478,9 @@ mod cases {
         let recorder = provider(&prefix, Duration::from_millis(80)).await.unwrap();
         let stale = acquire(&gateway, "writes").await;
         tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!recorder.renew(&stale).await.unwrap());
         let ticket = acquire(&gateway, "writes").await;
+        assert!(!recorder.renew(&stale).await.unwrap());
         assert!(!recorder.complete(&stale).await.unwrap());
         assert!(recorder.complete(&ticket).await.unwrap());
         let next = acquire(&gateway, "writes").await;
@@ -426,6 +494,7 @@ mod cases {
         assert!(provider.try_acquire("writes").await.is_err());
         let invalid = AdmissionTicket::new("writes", "foreign").unwrap();
         assert!(provider.complete(&invalid).await.is_err());
+        assert!(provider.renew(&invalid).await.is_err());
         fixture.abort();
     }
 
@@ -462,6 +531,7 @@ mod cases {
         assert!(provider.try_acquire("writes").await.is_err());
         let ticket = AdmissionTicket::new("writes", "token").unwrap();
         assert!(provider.complete(&ticket).await.is_err());
+        assert!(provider.renew(&ticket).await.is_err());
         fixture.abort();
     }
 

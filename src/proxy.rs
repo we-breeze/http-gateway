@@ -119,6 +119,9 @@ impl FallbackProxy {
             return Ok(error_response(StatusCode::BAD_GATEWAY, error.to_string()));
         }
 
+        let upgrades = request
+            .extensions_mut()
+            .remove::<crate::server::UpgradeTasks>();
         let mut response = match self.client.request(request).await {
             Ok(response) => response,
             Err(error) => {
@@ -133,7 +136,14 @@ impl FallbackProxy {
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             if let Some(downstream_upgrade) = downstream_upgrade.take() {
                 let upstream_upgrade = hyper::upgrade::on(&mut response);
-                tokio::spawn(tunnel(downstream_upgrade, upstream_upgrade));
+                let tunnel = tunnel(downstream_upgrade, upstream_upgrade);
+                if let Some(upgrades) = upgrades {
+                    upgrades.spawn(tunnel);
+                } else {
+                    // A caller using Gateway::handle on its own listener owns
+                    // that listener's connection and shutdown management.
+                    tokio::spawn(tunnel);
+                }
             }
         } else {
             remove_hop_by_hop_headers(response.headers_mut(), false);
