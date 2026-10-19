@@ -14,6 +14,9 @@ use tracing::{debug, warn};
 
 use crate::{Gateway, MatchedService};
 
+mod upgrade;
+pub(crate) use upgrade::UpgradeTasks;
+
 const MIN_HTTP1_BUFFER_SIZE: usize = 8 * 1024;
 
 /// Runtime limits and socket policy for a gateway listener.
@@ -69,7 +72,7 @@ impl GatewayConfig {
 }
 
 /// Accepts gateway connections until `shutdown` resolves, then drains active
-/// connections up to `shutdown_grace`.
+/// connections, including proxied upgrade tunnels, up to `shutdown_grace`.
 ///
 /// # Errors
 /// Returns an error when accepting a connection fails.
@@ -94,7 +97,8 @@ where
 }
 
 /// Accepts gateway connections using explicit resource and socket limits until
-/// `shutdown` resolves, then drains active connections up to `shutdown_grace`.
+/// `shutdown` resolves, then drains active connections, including proxied upgrade
+/// tunnels, up to `shutdown_grace`.
 ///
 /// # Errors
 /// Returns an error for an invalid configuration or when accepting a connection
@@ -132,7 +136,10 @@ where
                 let gateway = Arc::clone(&gateway);
                 connections.spawn(async move {
                     let _permit = permit;
-                    let service = service_fn(move |request| {
+                    let upgrades = UpgradeTasks::default();
+                    let request_upgrades = upgrades.clone();
+                    let service = service_fn(move |mut request: http::Request<hyper::body::Incoming>| {
+                        request.extensions_mut().insert(request_upgrades.clone());
                         let gateway = Arc::clone(&gateway);
                         async move {
                             Ok::<_, Infallible>(gateway.handle(request, peer_addr).await)
@@ -147,6 +154,9 @@ where
                         .with_upgrades();
                     if let Err(error) = connection.await {
                         debug!(%peer_addr, %error, "gateway connection closed with an error");
+                    }
+                    if let Err(error) = upgrades.finish().await {
+                        warn!(%peer_addr, %error, "gateway upgrade tunnel task failed");
                     }
                 });
             }

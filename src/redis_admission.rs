@@ -2,7 +2,8 @@
 //!
 //! A successful acquisition expires after 60 seconds by default. Recording
 //! requires no start/claim handshake. Completion can release the same token
-//! earlier, without deleting a newer acquisition after TTL expiry.
+//! earlier, without deleting a newer acquisition after TTL expiry. Receivers
+//! can explicitly renew a live reservation while its case is still running.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,13 @@ pub use registration::RecorderRegistration;
 const COMPLETE: &str = r#"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
     return redis.call('DEL', KEYS[1])
+end
+return 0
+"#;
+
+const RENEW: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
 end
 return 0
 "#;
@@ -92,6 +100,13 @@ impl<R: Redis + 'static> RedisAdmissionProvider<R> {
         })
     }
 
+    /// Returns the configured request-reservation TTL. Receivers can schedule
+    /// renewal before expiry, for example every `provider.reservation_ttl() / 3`.
+    #[must_use]
+    pub fn reservation_ttl(&self) -> Duration {
+        Duration::from_millis(self.ttl_ms)
+    }
+
     /// Enables background election using `<key_prefix>:max-gateways` in Redis.
     /// Configure before cloning/registering the provider. Gateways sharing the
     /// prefix read the same limit. Requires a running Tokio runtime.
@@ -132,7 +147,17 @@ impl<R: Redis + 'static> RedisAdmissionProvider<R> {
     /// Recorder-side release after the case and all dependencies finish. An old
     /// ticket cannot release another reservation. Safe to retry with this token.
     pub async fn complete(&self, ticket: &AdmissionTicket) -> Result<bool, AdmissionError> {
-        self.transition(COMPLETE, ticket).await
+        self.transition(COMPLETE, ticket, &[ticket.token()]).await
+    }
+
+    /// Extends a live reservation by this provider's configured TTL. The
+    /// receiver owns renewal scheduling until the case and dependencies finish.
+    /// Returns false if the reservation expired or its token was replaced;
+    /// renewal never recreates a missing slot or extends a different owner.
+    pub async fn renew(&self, ticket: &AdmissionTicket) -> Result<bool, AdmissionError> {
+        let ttl = self.ttl_ms.to_string();
+        self.transition(RENEW, ticket, &[ticket.token(), &ttl])
+            .await
     }
 
     /// Receiver-side validation before dispatching a forwarded reservation.
@@ -158,11 +183,12 @@ impl<R: Redis + 'static> RedisAdmissionProvider<R> {
         &self,
         script: &str,
         ticket: &AdmissionTicket,
+        args: &[&str],
     ) -> Result<bool, AdmissionError> {
         let key = self.key(ticket.scope());
         let result: Value = self
             .redis
-            .eval(script, &[key.as_str()], &[ticket.token()])
+            .eval(script, &[key.as_str()], args)
             .await
             .map_err(AdmissionError::backend)?;
         match result {
