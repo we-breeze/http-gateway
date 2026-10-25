@@ -180,6 +180,15 @@ async fn ordinary_migration_routes_do_not_replay_a_404() {
 
 #[tokio::test]
 async fn recording_connect_failure_preserves_the_fallback_upgrade_tunnel() {
+    recording_upgrade_preserves_empty_handshake(true).await;
+}
+
+#[tokio::test]
+async fn recording_upgrade_preserves_the_bodyless_handshake() {
+    recording_upgrade_preserves_empty_handshake(false).await;
+}
+
+async fn recording_upgrade_preserves_empty_handshake(unreachable: bool) {
     let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let original_origin = format!("http://{}", original.local_addr().unwrap())
         .parse()
@@ -189,12 +198,21 @@ async fn recording_connect_failure_preserves_the_fallback_upgrade_tunnel() {
     let recorder_origin = format!("http://{}", recorder.local_addr().unwrap())
         .parse()
         .unwrap();
+    let upstream = if unreachable {
+        original
+    } else {
+        recorder.listen(128).unwrap()
+    };
     let original_task = tokio::spawn(async move {
-        let (mut stream, _) = original.accept().await.unwrap();
+        let (mut stream, _) = upstream.accept().await.unwrap();
         let headers = head(&mut stream).await.to_ascii_lowercase();
         assert!(headers.starts_with("get /upgrade http/1.1"));
         assert!(headers.contains("upgrade: example"));
-        assert!(!headers.contains("x-breeze-admission"));
+        assert_eq!(headers.contains("x-breeze-admission"), !unreachable);
+        // Strict WebSocket servers reject a request body even when its
+        // declared length is zero. Buffering an empty request must not add it.
+        assert!(!headers.contains("content-length:"));
+        assert!(!headers.contains("transfer-encoding:"));
         stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: example\r\n\r\n").await.unwrap();
         let mut message = [0; 4];
         stream.read_exact(&mut message).await.unwrap();
@@ -242,5 +260,4 @@ async fn recording_connect_failure_preserves_the_fallback_upgrade_tunnel() {
         assert_eq!(stream.read(&mut message).await.unwrap(), 0);
         original_task.await.unwrap();
     }).await.unwrap();
-    drop(recorder);
 }

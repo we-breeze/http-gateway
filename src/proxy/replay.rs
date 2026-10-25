@@ -59,7 +59,10 @@ impl FallbackProxy {
 
 fn replay_body(bytes: Bytes, trailers: Option<HeaderMap>) -> GatewayBody {
     ReplayBody {
-        bytes: Some(bytes),
+        // Match the frames poll_frame can actually emit. An empty body with
+        // no trailers is already ended; otherwise Hyper adds a zero length
+        // body to GET upgrade handshakes that strict WebSocket peers reject.
+        bytes: (!bytes.is_empty()).then_some(bytes),
         trailers,
     }
     .boxed()
