@@ -82,6 +82,15 @@ to a fallback origin. Ordinary proxy paths preserve request and response streami
 repeated headers such as `Set-Cookie`, connection cancellation/backpressure, and
 HTTP upgrades such as WebSocket.
 
+The listener and generic Upgrade/relay machinery are provided by
+`brz-http-server` with its optional `hyper` feature. The gateway owns HTTP route
+selection and upstream choice. After a backend returns HTTP 101, the fixed
+client/backend connection pair relays bytes without inspecting WebSocket or
+Socket.IO frames. Namespace, event, room and ACK handling belongs to the backend.
+Ordinary keep-alive HTTP requests still route independently. Multi-backend
+Engine.IO polling needs separate cross-request affinity; Redis event delivery
+does not provide transport-session affinity.
+
 The crate contains no Wegent or Python-specific behavior. An empty route table
 is a transparent all-fallback configuration.
 

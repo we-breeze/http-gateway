@@ -2,6 +2,9 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::net::SocketAddr;
 
+use brz_http_server::hyper::{
+    PendingUpgrade as OnUpgrade, relay, request_upgrade, response_upgrade,
+};
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue, UPGRADE};
 use http::uri::{Authority, Scheme};
@@ -9,11 +12,9 @@ use http::{Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::io::copy_bidirectional;
+use hyper_util::rt::TokioExecutor;
 use tracing::debug;
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -90,7 +91,7 @@ impl FallbackProxy {
         peer_addr: SocketAddr,
     ) -> GatewayResponse {
         let mut downstream_upgrade =
-            is_upgrade(request.headers()).then(|| hyper::upgrade::on(&mut request));
+            is_upgrade(request.headers()).then(|| request_upgrade(&mut request));
         self.try_forward_body(request, peer_addr, &mut downstream_upgrade)
             .await
             .unwrap_or_else(|_| upstream_unavailable())
@@ -121,7 +122,7 @@ impl FallbackProxy {
 
         let upgrades = request
             .extensions_mut()
-            .remove::<crate::server::UpgradeTasks>();
+            .remove::<brz_http_server::hyper::UpgradeTasks>();
         let mut response = match self.client.request(request).await {
             Ok(response) => response,
             Err(error) => {
@@ -135,13 +136,16 @@ impl FallbackProxy {
 
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             if let Some(downstream_upgrade) = downstream_upgrade.take() {
-                let upstream_upgrade = hyper::upgrade::on(&mut response);
-                let tunnel = tunnel(downstream_upgrade, upstream_upgrade);
+                let upstream_upgrade = response_upgrade(&mut response);
+                let tunnel = async move {
+                    if let Err(error) = relay(downstream_upgrade, upstream_upgrade).await {
+                        debug!(%error, "upgraded fallback tunnel closed with an error");
+                    }
+                };
                 if let Some(upgrades) = upgrades {
                     upgrades.spawn(tunnel);
                 } else {
-                    // A caller using Gateway::handle on its own listener owns
-                    // that listener's connection and shutdown management.
+                    // Custom listeners own their connection lifecycle.
                     tokio::spawn(tunnel);
                 }
             }
@@ -271,17 +275,6 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
         bytes = &bytes[..bytes.len() - 1];
     }
     bytes
-}
-
-async fn tunnel(downstream: OnUpgrade, upstream: OnUpgrade) {
-    let (Ok(downstream), Ok(upstream)) = tokio::join!(downstream, upstream) else {
-        return;
-    };
-    let mut downstream = TokioIo::new(downstream);
-    let mut upstream = TokioIo::new(upstream);
-    if let Err(error) = copy_bidirectional(&mut downstream, &mut upstream).await {
-        debug!(%error, "upgraded fallback tunnel closed with an error");
-    }
 }
 
 pub(crate) fn error_response(status: StatusCode, message: impl Into<Bytes>) -> GatewayResponse {

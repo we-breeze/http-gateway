@@ -4,18 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tracing::{debug, warn};
 
 use crate::{Gateway, MatchedService};
-
-mod upgrade;
-pub(crate) use upgrade::UpgradeTasks;
 
 const MIN_HTTP1_BUFFER_SIZE: usize = 8 * 1024;
 
@@ -97,8 +89,7 @@ where
 }
 
 /// Accepts gateway connections using explicit resource and socket limits until
-/// `shutdown` resolves, then drains active connections, including proxied upgrade
-/// tunnels, up to `shutdown_grace`.
+/// `shutdown` resolves, then drains active connections up to `shutdown_grace`.
 ///
 /// # Errors
 /// Returns an error for an invalid configuration or when accepting a connection
@@ -116,71 +107,25 @@ where
 {
     config.validate()?;
     let gateway = Arc::new(gateway);
-    let connection_limit = Arc::new(Semaphore::new(config.max_connections));
-    let mut connections = JoinSet::new();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            () = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let (stream, peer_addr) = accepted?;
-                let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
-                    debug!(%peer_addr, "rejecting gateway connection at capacity");
-                    drop(stream);
-                    continue;
-                };
-                if let Err(error) = stream.set_nodelay(config.tcp_nodelay) {
-                    warn!(%peer_addr, %error, "failed to configure gateway connection");
-                    continue;
-                }
+    brz_http_server::hyper::serve(
+        listener,
+        move |peer_addr| {
+            let gateway = Arc::clone(&gateway);
+            service_fn(move |request| {
                 let gateway = Arc::clone(&gateway);
-                connections.spawn(async move {
-                    let _permit = permit;
-                    let upgrades = UpgradeTasks::default();
-                    let request_upgrades = upgrades.clone();
-                    let service = service_fn(move |mut request: http::Request<hyper::body::Incoming>| {
-                        request.extensions_mut().insert(request_upgrades.clone());
-                        let gateway = Arc::clone(&gateway);
-                        async move {
-                            Ok::<_, Infallible>(gateway.handle(request, peer_addr).await)
-                        }
-                    });
-                    let connection = http1::Builder::new()
-                        .keep_alive(true)
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(config.header_read_timeout)
-                        .max_buf_size(config.max_request_head_bytes)
-                        .serve_connection(TokioIo::new(stream), service)
-                        .with_upgrades();
-                    if let Err(error) = connection.await {
-                        debug!(%peer_addr, %error, "gateway connection closed with an error");
-                    }
-                    if let Err(error) = upgrades.finish().await {
-                        warn!(%peer_addr, %error, "gateway upgrade tunnel task failed");
-                    }
-                });
-            }
-            joined = connections.join_next(), if !connections.is_empty() => {
-                if let Some(Err(error)) = joined {
-                    warn!(%error, "gateway connection task failed");
-                }
-            }
-        }
-    }
-
-    if tokio::time::timeout(shutdown_grace, async {
-        while let Some(joined) = connections.join_next().await {
-            if let Err(error) = joined {
-                warn!(%error, "gateway connection task failed during shutdown");
-            }
-        }
-    })
-    .await
-    .is_err()
-    {
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
-    }
+                async move { Ok::<_, Infallible>(gateway.handle(request, peer_addr).await) }
+            })
+        },
+        shutdown,
+        brz_http_server::hyper::Config {
+            max_connections: config.max_connections,
+            max_request_head_bytes: config.max_request_head_bytes,
+            header_read_timeout: config.header_read_timeout,
+            shutdown_grace,
+            tcp_nodelay: config.tcp_nodelay,
+        },
+    )
+    .await?;
     Ok(())
 }
 

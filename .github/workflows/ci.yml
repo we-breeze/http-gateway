@@ -12,6 +12,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: http-gateway
     services:
       redis:
         image: redis:7
@@ -26,6 +29,8 @@ jobs:
       BREEZE_REDIS_TEST_ENDPOINT: 127.0.0.1:6379
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: http-gateway
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

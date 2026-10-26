@@ -32,7 +32,10 @@ impl FallbackProxy {
         *retry.uri_mut() = request.uri().clone();
         *retry.version_mut() = request.version();
         *retry.headers_mut() = request.headers().clone();
-        if let Some(upgrades) = request.extensions().get::<crate::server::UpgradeTasks>() {
+        if let Some(upgrades) = request
+            .extensions()
+            .get::<brz_http_server::hyper::UpgradeTasks>()
+        {
             retry.extensions_mut().insert(upgrades.clone());
         }
         retry.headers_mut().remove(crate::ADMISSION_SCOPE_HEADER);
