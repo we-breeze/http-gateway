@@ -3,7 +3,8 @@
 //! The gateway is application-independent. A typed [`RouteTable`] selects
 //! requests for a caller-provided [`MatchedService`]; unmatched requests are
 //! proxied with streaming bodies, repeated headers, cancellation/backpressure,
-//! and HTTP upgrades preserved. An empty route table forwards every request.
+//! and HTTP upgrades preserved. An empty route table forwards every request
+//! unless [`Gateway::with_recording_admission`] enables global recording.
 
 mod admission;
 mod config;

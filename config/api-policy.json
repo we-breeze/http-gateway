@@ -1,0 +1,11 @@
+{
+  "case-limit": 200,
+  "includes": [
+    { "path": "/api", "match": "prefix" },
+    { "path": "/api/:id/xxx", "match": "exact" }
+  ],
+  "excludes": [
+    { "path": "/socket.io", "match": "prefix" },
+    { "path": "/api/internal", "match": "prefix" }
+  ]
+}

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use brz_http_gateway::{
     ADMISSION_SCOPE_HEADER, ADMISSION_TOKEN_HEADER, AcquireOutcome, AdmissionError,
-    AdmissionFuture, AdmissionProvider, AdmissionRegistry, AdmissionTicket, Gateway,
+    AdmissionFuture, AdmissionProvider, AdmissionRegistry, AdmissionRule, AdmissionTicket, Gateway,
     GatewayBuildError, GatewayResponse, MatchedService, RejectMatched, RouteTable, RoutesConfig,
 };
 use bytes::Bytes;
@@ -132,6 +132,16 @@ async fn request(address: SocketAddr, method: &str, path: &str) -> String {
 }
 
 async fn exercise(decision: Decision, method: &str, path: &str, selected_status: StatusCode) {
+    exercise_mode(decision, method, path, selected_status, false).await;
+}
+
+async fn exercise_mode(
+    decision: Decision,
+    method: &str,
+    path: &str,
+    selected_status: StatusCode,
+    global: bool,
+) {
     let fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", fallback.local_addr().unwrap())
         .parse()
@@ -163,7 +173,21 @@ async fn exercise(decision: Decision, method: &str, path: &str, selected_status:
     };
     let mut registry = AdmissionRegistry::new();
     registry.register("recorder", decision).unwrap();
-    let gateway = Gateway::with_admission(routes(), selected, &origin, registry).unwrap();
+    let table = if global {
+        RouteTable::empty()
+    } else {
+        routes()
+    };
+    let mut gateway = Gateway::with_admission(table, selected, &origin, registry).unwrap();
+    if global {
+        gateway = gateway
+            .with_recording_admission(AdmissionRule {
+                provider: "recorder".into(),
+                scope: "all-writes".into(),
+                acquire_timeout_ms: 20,
+            })
+            .unwrap();
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop, stopped) = oneshot::channel();
@@ -177,7 +201,9 @@ async fn exercise(decision: Decision, method: &str, path: &str, selected_status:
     ));
 
     let response = request(address, method, path).await;
-    if path == "/unrestricted" || matches!(decision, Decision::Acquired) && method != "GET" {
+    if path == "/unrestricted"
+        || matches!(decision, Decision::Acquired) && (global || method != "GET")
+    {
         assert!(response.starts_with(&format!("HTTP/1.1 {}", selected_status.as_u16())));
         assert!(response.ends_with("selected"));
         assert_eq!(selected_calls.load(Ordering::SeqCst), 1);
@@ -191,6 +217,56 @@ async fn exercise(decision: Decision, method: &str, path: &str, selected_status:
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
     fallback_task.abort();
+}
+
+#[tokio::test]
+async fn global_admission_uses_empty_routes_and_existing_provider_implementations() {
+    exercise_mode(
+        Decision::Acquired,
+        "GET",
+        "/unlisted?query=1",
+        StatusCode::CREATED,
+        true,
+    )
+    .await;
+    for decision in [
+        Decision::Busy,
+        Decision::Error,
+        Decision::Timeout,
+        Decision::WrongScope,
+    ] {
+        exercise_mode(decision, "GET", "/unlisted", StatusCode::OK, true).await;
+    }
+}
+
+#[test]
+fn global_admission_validates_scope_timeout_and_provider() {
+    let origin = "http://127.0.0.1:9000".parse().unwrap();
+    for (provider, scope, timeout) in [
+        ("", "scope", 50),
+        ("recorder", "", 50),
+        ("recorder", "scope", 0),
+        ("recorder", "invalid\r\nscope", 50),
+    ] {
+        let gateway = Gateway::new(RouteTable::empty(), RejectMatched, &origin).unwrap();
+        assert!(matches!(
+            gateway.with_recording_admission(AdmissionRule {
+                provider: provider.into(),
+                scope: scope.into(),
+                acquire_timeout_ms: timeout,
+            }),
+            Err(GatewayBuildError::InvalidRecordingAdmission)
+        ));
+    }
+    let gateway = Gateway::new(RouteTable::empty(), RejectMatched, &origin).unwrap();
+    assert!(matches!(
+        gateway.with_recording_admission(AdmissionRule {
+            provider: "missing".into(),
+            scope: "scope".into(),
+            acquire_timeout_ms: 50,
+        }),
+        Err(GatewayBuildError::MissingRecordingProvider { .. })
+    ));
 }
 
 #[tokio::test]

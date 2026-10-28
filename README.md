@@ -366,6 +366,171 @@ and response length. Unknown lengths use `-`:
 2026-09-19 18:13:02 [FALLBACK] GET /api/quota?q=a 200 102ms - 133
 ```
 
+## Redis API policy and per-path case limits
+
+Enable `redis-recording` and use global recording admission to select APIs from
+Redis without listing them in `routes.toml`. The caller keeps its ordinary
+business routing; for a hybrid application, install this gateway in the Python
+fallback branch after selecting Rust-owned APIs.
+
+```rust,no_run
+# #[cfg(feature = "redis-recording")]
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use brz_http_gateway::{AdmissionRegistry, AdmissionRule, Gateway, OriginService, RouteTable};
+use brz_http_gateway::redis_admission::{GatewayLeaseConfig, RedisAdmissionProvider};
+use brz_redis::RedisService;
+
+let redis = RedisService::single("127.0.0.1:6379").await?;
+let provider = RedisAdmissionProvider::new(
+    redis, "recording:wegent", "recording:wegent:url",
+)?
+.with_gateway_limit(GatewayLeaseConfig::new(""))?;
+let mut registry = AdmissionRegistry::new();
+registry.register("recorder", provider.clone())?;
+let gateway = Gateway::with_admission(
+    RouteTable::empty(), OriginService::from_admission(),
+    &"http://original:9000".parse()?, registry,
+)?
+.with_recording_admission(AdmissionRule {
+    provider: "recorder".into(),
+    scope: "all-apis".into(),
+    acquire_timeout_ms: 50,
+})?;
+# let _ = gateway;
+# Ok(())
+# }
+```
+
+`with_recording_admission` applies to every non-excluded path, including an empty
+route table. It takes precedence over route-level admission on this gateway.
+Existing `routes.toml` exclusions and application-wide CORS preflights still take
+precedence. Use the same scope as the Recorder: scope/token headers and
+`<prefix>:inflight:<scope>` retain their existing protocol.
+
+Two keys are added per business prefix; neither includes scope:
+
+| Key | Type | Contents and access |
+| --- | --- | --- |
+| `<prefix>:api-policy` | String | JSON policy, read at startup and periodically |
+| `<prefix>:api-counts` | Hash | API path/pattern field, integer admitted-case count |
+
+Publish the example with:
+
+```sh
+redis-cli -x SET recording:wegent:api-policy < config/api-policy.json
+redis-cli SET recording:wegent:max-gateways 2
+```
+
+The policy has three optional fields:
+
+```json
+{
+  "case-limit": 200,
+  "includes": [
+    { "path": "/api", "match": "prefix" },
+    { "path": "/api/:id/xxx", "match": "exact" }
+  ],
+  "excludes": [{ "path": "/socket.io", "match": "prefix" }]
+}
+```
+
+- Missing or empty `includes` allows all paths. Missing `excludes` excludes none.
+- `prefix` is the default match kind and uses literal path segments: `/api`
+  includes itself and `/api/...`, but not `/apix`. A trailing slash on the prefix
+  is normalized. Prefix `/` includes all paths.
+- `exact` matches the complete path and supports router case patterns such as
+  `:id` and terminal `*rest`. Query parameters are ignored. Rules apply to every
+  HTTP method, and any exclusion wins.
+- An included exact rule supplies the counter field, e.g. `/api/:id/xxx` for
+  `/api/123/xxx` and `/api/456/xxx`, even when a broader prefix also includes them.
+  Multiple matching exact rules use declaration order. Prefix-only matches use
+  the actual path. GET, POST and other methods share the same field and limit.
+- `case-limit` is one nonnegative integer upper bound for each API path, not a
+  combined budget for an entire prefix. Zero disables new recordings. Omitting
+  it leaves recordings uncapped and skips both counter commands.
+
+`RedisAdmissionProvider::load_policy().await` performs one bounded (200 ms) load,
+compiles changed rules, and atomically replaces a snapshot shared by all provider
+clones. Unchanged values are not recompiled. Concurrent loads are serialized.
+With `with_gateway_limit`, the existing participation task loads immediately,
+then refreshes policy after its lease work on every cycle, including on standbys
+(approximately 10 seconds by default). Background loads are additionally capped
+at one quarter of the lease refresh interval so short custom leases retain time
+to renew. Policy errors preserve the previous snapshot and do not revoke a valid
+gateway lease. No additional refresh task or per-request task is spawned.
+
+Until the first successful load, global recording falls back locally. A missing
+policy key successfully loads the default: all paths, no case cap. Deleting the
+policy therefore restores that default; use `case-limit: 0` or
+`<prefix>:max-gateways = 0` to pause recording. Without `with_gateway_limit`, the
+caller must invoke `load_policy` and own subsequent refresh scheduling.
+
+For eligible requests, Redis operations are sequential and use the existing
+client/writer routing:
+
+```text
+GET <recorder_url_key>                 # missing: fallback, no counter access
+HGET <prefix>:api-counts <path>        # at limit: fallback; missing count is 0
+SET <prefix>:inflight:<scope> <token> NX PX <ttl_ms>
+HINCRBY <prefix>:api-counts <path> 1   # only after acquiring the request slot
+```
+
+The check, reservation and increment use ordinary commands; quota enforcement
+is approximate. Busy slots do not increment counts, and quota exhaustion does
+not start discovery cooldown. Errors/timeouts before dispatch use the existing
+fallback and cooldown behavior. A reservation may remain until TTL if counting
+fails or acquisition is cancelled after SET. A count may remain consumed without
+a recorded case when forwarding subsequently fails. Recorder-side ownership
+checks, renewal, completion and local single-case protection remain unchanged.
+
+Reset counts once in the recording controller after the previous round has
+finished and before exposing a new round:
+
+```redis
+DEL recording:wegent:api-counts
+```
+
+Gateway startup and policy reload never reset counts. Exhausted counts are not
+cached locally, so a reset or increased limit can admit requests on the next
+check (a changed limit first needs its ordinary policy refresh).
+
+Performance: policy matching uses compiled router indexes and an atomically
+shared snapshot, borrowing the counter path without allocating an API string.
+Local policy rejection and nonparticipation issue zero request-level Redis
+commands. Missing-recorder cooldown still avoids repeated Redis attempts.
+An eligible request without a Recorder issues only the address GET; an exhausted
+API uses GET + HGET; a busy slot uses three commands. Successful capped admission
+uses four commands versus the two-command legacy path, adding two sequential
+Redis round trips. Uncapped admission retains two commands. Each gateway adds
+one background policy GET per refresh cycle. No new quota Lua script is used.
+
+The old `AdmissionProvider::try_acquire(scope)` and route-level admission remain
+lock-only. Global admission calls the new `try_acquire_request(scope, path)`;
+its default delegates to the old method for existing custom providers. Custom
+matches over `AcquireOutcome` should also handle the new normal fallback results
+`NotEligible` and `QuotaExhausted`.
+
+Focused verification and an opt-in CPU microbenchmark:
+
+```sh
+cargo test --locked --all-features --test redis_policy
+cargo test --locked --release --all-features policy_match_cost -- --ignored --nocapture
+cargo test --locked --release --all-features --test redis_policy loopback_admission_cost -- --ignored --nocapture
+```
+
+A local release-build sample with 100 rules and mixed hits/misses measured
+60 ns for the router alone and 153 ns for policy matching plus snapshot access
+(about 93 ns additional CPU). The loopback RESP fixture measured admission plus
+completion at 163 microseconds for legacy admission and 265 microseconds with
+counting. These are single development-host samples: the fixture is not Redis,
+and neither benchmark includes business HTTP forwarding or measures production
+latency percentiles. The command-count tests establish the additional two Redis
+round trips; production overhead depends primarily on the Redis RTT.
+
+Set `BREEZE_REDIS_TEST_ENDPOINT` to run the opt-in real Redis coverage, including
+independent clients, shared path counts, limits and reset recovery. It creates
+uniquely prefixed keys and deletes its policy/count data after success.
+
 ## Crate naming
 
 The package is `brz-http-gateway`; import it as `brz_http_gateway`.

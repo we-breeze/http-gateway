@@ -78,6 +78,16 @@ fn default_admission_acquire_timeout_ms() -> u64 {
     50
 }
 
+impl AdmissionRule {
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.provider.trim().is_empty()
+            && !self.scope.trim().is_empty()
+            && self.scope.is_ascii()
+            && HeaderValue::from_str(&self.scope).is_ok()
+            && self.acquire_timeout_ms > 0
+    }
+}
+
 /// Validated route table shared by gateway connections.
 #[derive(Clone, Debug, Default)]
 pub struct RouteTable {
@@ -124,12 +134,7 @@ impl RouteTable {
             .enumerate()
             .map(|(index, rule)| {
                 if let Some(admission) = &rule.admission {
-                    if admission.provider.trim().is_empty()
-                        || admission.scope.trim().is_empty()
-                        || !admission.scope.is_ascii()
-                        || HeaderValue::from_str(&admission.scope).is_err()
-                        || admission.acquire_timeout_ms == 0
-                    {
+                    if !admission.is_valid() {
                         return Err(ConfigError::InvalidAdmission { index });
                     }
                 }
@@ -180,13 +185,17 @@ impl RouteTable {
     /// Overlapping routes must
     /// declare the desired admission policy on the first matching entry.
     pub(crate) fn select(&self, method: &Method, path: &str) -> Option<usize> {
-        if self.exclusions.matches(method, path) {
+        if self.is_excluded(method, path) {
             return None;
         }
         self.index
             .resolve(method.as_str(), path, brz_http_router::PathMode::Raw)
             .selected()
             .map(|route| route.id())
+    }
+
+    pub(crate) fn is_excluded(&self, method: &Method, path: &str) -> bool {
+        self.exclusions.matches(method, path)
     }
 
     pub(crate) fn admissions(&self) -> &[Option<AdmissionRule>] {

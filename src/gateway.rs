@@ -95,6 +95,7 @@ pub struct Gateway<S> {
     matched: S,
     fallback: FallbackProxy,
     admission: AdmissionRegistry,
+    recording_admission: Option<crate::AdmissionRule>,
     cors: Option<crate::Cors>,
 }
 
@@ -138,8 +139,29 @@ where
             matched,
             fallback: FallbackProxy::new(fallback_origin)?,
             admission,
+            recording_admission: None,
             cors: None,
         })
+    }
+
+    /// Applies request-aware recording admission to every non-excluded request,
+    /// including paths absent from the route table. Acquired requests enter the
+    /// matched service; all other outcomes use the fallback origin. When set,
+    /// this policy replaces route-level admission for this gateway instance.
+    pub fn with_recording_admission(
+        mut self,
+        rule: crate::AdmissionRule,
+    ) -> Result<Self, GatewayBuildError> {
+        if !rule.is_valid() {
+            return Err(GatewayBuildError::InvalidRecordingAdmission);
+        }
+        if self.admission.get(&rule.provider).is_none() {
+            return Err(GatewayBuildError::MissingRecordingProvider {
+                provider: rule.provider,
+            });
+        }
+        self.recording_admission = Some(rule);
+        Ok(self)
     }
 
     /// Enables application-wide CORS before route selection and admission.
@@ -187,19 +209,30 @@ where
             .cloned();
         let selected = self.routes.select(request.method(), request.uri().path());
         let mut matched = selected.is_some();
-        if let Some(rule) = selected.and_then(|id| self.routes.admissions()[id].as_ref()) {
+        let global = self.recording_admission.as_ref().filter(|_| {
+            !self
+                .routes
+                .is_excluded(request.method(), request.uri().path())
+        });
+        let rule = global.or_else(|| selected.and_then(|id| self.routes.admissions()[id].as_ref()));
+        if let Some(rule) = rule {
             let provider = self
                 .admission
                 .get(&rule.provider)
                 .expect("configured providers were validated at construction");
             let result = tokio::time::timeout(
                 Duration::from_millis(rule.acquire_timeout_ms),
-                provider.try_acquire(&rule.scope),
+                if global.is_some() {
+                    provider.try_acquire_request(&rule.scope, request.uri().path())
+                } else {
+                    provider.try_acquire(&rule.scope)
+                },
             )
             .await
             .unwrap_or(Err(AdmissionError::Timeout));
             match result {
                 Ok(AcquireOutcome::Acquired(ticket)) if ticket.scope() == rule.scope => {
+                    matched = true;
                     ticket.attach(&mut request);
                     request
                         .extensions_mut()
@@ -208,7 +241,9 @@ where
                 Ok(
                     AcquireOutcome::Busy
                     | AcquireOutcome::NoRecorder
-                    | AcquireOutcome::NotParticipant,
+                    | AcquireOutcome::NotParticipant
+                    | AcquireOutcome::NotEligible
+                    | AcquireOutcome::QuotaExhausted,
                 ) => matched = false,
                 outcome => {
                     let error = match outcome {
@@ -278,6 +313,12 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayBuildError {
+    #[error(
+        "global recording admission requires a provider, a header-safe nonempty scope and a positive acquire_timeout_ms"
+    )]
+    InvalidRecordingAdmission,
+    #[error("global recording admission references an unregistered provider: {provider}")]
+    MissingRecordingProvider { provider: String },
     #[error("invalid CORS policy")]
     InvalidCorsPolicy,
     #[error(transparent)]

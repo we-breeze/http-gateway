@@ -5,7 +5,7 @@ use brz_redis::{Redis, Value, cmd};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::{COMPLETE, reserve};
+use super::{COMPLETE, policy::PolicyStore, reserve};
 use crate::AdmissionError;
 
 const RENEW: &str = r#"
@@ -75,6 +75,7 @@ impl GatewayLease {
         redis: Arc<R>,
         prefix: String,
         mut config: GatewayLeaseConfig,
+        policy: Arc<PolicyStore>,
     ) -> Result<Self, GatewayLeaseConfigError> {
         config.validate()?;
         let runtime = tokio::runtime::Handle::try_current()
@@ -86,7 +87,7 @@ impl GatewayLease {
         let state = Arc::clone(&valid_until);
         // Restarting the same instance ID never reuses the old lease token.
         let token = format!("{}:{:032x}", config.instance_id, rand::random::<u128>());
-        let task = runtime.spawn(run(redis, prefix, token, config, state));
+        let task = runtime.spawn(run(redis, prefix, token, config, state, policy));
         Ok(Self { valid_until, task })
     }
 
@@ -109,7 +110,9 @@ async fn run<R: Redis + 'static>(
     token: String,
     config: GatewayLeaseConfig,
     state: Arc<Mutex<Option<Instant>>>,
+    policy: Arc<PolicyStore>,
 ) {
+    refresh_policy(redis.as_ref(), &policy, &config).await;
     // Avoid a synchronized election when a deployment starts many gateways.
     tokio::time::sleep(config.refresh_interval.mul_f64(rand::random::<f64>())).await;
     let mut owned_slot = None;
@@ -134,6 +137,9 @@ async fn run<R: Redis + 'static>(
             tracing::warn!(instance = %config.instance_id, %error,
                 "gateway participation refresh failed");
         }
+        // Policy failures are independent of lease ownership. A bounded load
+        // runs after renewal even on standbys, without another background task.
+        refresh_policy(redis.as_ref(), &policy, &config).await;
         // Standbys wait at least one full interval before competing again.
         // Renewals may run slightly earlier to protect an existing lease.
         let jitter = if is_valid(&state) {
@@ -142,6 +148,17 @@ async fn run<R: Redis + 'static>(
             1.0 + rand::random::<f64>() * 0.2
         };
         tokio::time::sleep(config.refresh_interval.mul_f64(jitter)).await;
+    }
+}
+
+async fn refresh_policy<R: Redis>(redis: &R, policy: &PolicyStore, config: &GatewayLeaseConfig) {
+    // A short custom lease must not be delayed by the ordinary 200 ms load
+    // budget. Preserve room for election/renewal and its existing jitter.
+    let result = tokio::time::timeout(config.refresh_interval / 4, policy.load(redis))
+        .await
+        .unwrap_or(Err(AdmissionError::Timeout));
+    if let Err(error) = result {
+        tracing::warn!(instance = %config.instance_id, %error, "API policy refresh failed");
     }
 }
 

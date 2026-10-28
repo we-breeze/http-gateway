@@ -34,6 +34,9 @@ async fn acquire(provider: &RedisAdmissionProvider, scope: &str) -> AdmissionTic
         AcquireOutcome::Busy => panic!("expected a free slot"),
         AcquireOutcome::NoRecorder => panic!("expected a registered recorder"),
         AcquireOutcome::NotParticipant => panic!("expected a participating gateway"),
+        AcquireOutcome::NotEligible | AcquireOutcome::QuotaExhausted => {
+            panic!("unexpected policy decision in legacy admission")
+        }
     }
 }
 
@@ -1268,7 +1271,12 @@ mod cases {
                             bytes.truncate(len);
                             args.push(bytes);
                         }
-                        if let Some(response) = reply(args) {
+                        let response = if args[0] == b"GET" && args[1].ends_with(b":api-policy") {
+                            Some(b"$-1\r\n".to_vec())
+                        } else {
+                            reply(args)
+                        };
+                        if let Some(response) = response {
                             if writer.write_all(&response).await.is_err() {
                                 break;
                             }

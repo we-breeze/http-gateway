@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/we-breeze/http-gateway"
 
 [dependencies]
+arc-swap = { version = "1", optional = true }
 brz-http-server = { version = "=0.0.33", features = ["hyper"] }
 brz-http-cors = "=0.0.6"
 bytes = "1"
@@ -31,7 +32,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 [features]
 default = []
 fallback-log = []
-redis-recording = ["dep:brz-redis", "dep:rand", "dep:serde_json"]
+redis-recording = ["dep:arc-swap", "dep:brz-redis", "dep:rand", "dep:serde_json"]
 
 [lints.rust]
 unsafe_code = "deny"
@@ -41,3 +42,7 @@ all = { level = "warn", priority = -1 }
 
 [lib]
 name = "brz_http_gateway"
+
+[[example]]
+name = "redis-recording"
+required-features = ["redis-recording"]

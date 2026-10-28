@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use brz_http_gateway::{
-    AcquireOutcome, AdmissionFuture, AdmissionProvider, AdmissionRegistry, Cors, Gateway,
-    GatewayBuildError, GatewayResponse, MatchedService, RouteTable, RoutesConfig,
+    AcquireOutcome, AdmissionFuture, AdmissionProvider, AdmissionRegistry, AdmissionRule, Cors,
+    Gateway, GatewayBuildError, GatewayResponse, MatchedService, RouteTable, RoutesConfig,
 };
 use bytes::Bytes;
 use http::{Request, Response, Uri};
@@ -160,6 +160,35 @@ async fn preflight_does_not_call_admission_or_the_matched_service() {
     let gateway = Gateway::with_admission(routes(
         "[[routes]]\npath = \"/api/*path\"\nadmission = { provider = \"recorder\", scope = \"all\" }"
     ), selected.clone(), &origin, admission).unwrap().with_cors(policy()).unwrap();
+    assert!(
+        request(gateway, PREFLIGHT)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert_eq!(acquisitions.load(Ordering::SeqCst), 0);
+    assert_eq!(selected.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn preflight_precedes_global_recording_admission() {
+    let (origin, _reservation) = unavailable();
+    let acquisitions = Arc::new(AtomicUsize::new(0));
+    let mut admission = AdmissionRegistry::new();
+    admission
+        .register("recorder", Provider(Arc::clone(&acquisitions)))
+        .unwrap();
+    let selected = Selected::default();
+    let gateway =
+        Gateway::with_admission(RouteTable::empty(), selected.clone(), &origin, admission)
+            .unwrap()
+            .with_recording_admission(AdmissionRule {
+                provider: "recorder".into(),
+                scope: "all-apis".into(),
+                acquire_timeout_ms: 50,
+            })
+            .unwrap()
+            .with_cors(policy())
+            .unwrap();
     assert!(
         request(gateway, PREFLIGHT)
             .await

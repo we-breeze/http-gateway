@@ -14,6 +14,7 @@ use crate::{AcquireOutcome, AdmissionError, AdmissionFuture, AdmissionProvider, 
 
 mod discovery;
 mod lease;
+mod policy;
 mod registration;
 use discovery::{LookupUnavailable, RecorderDiscovery};
 use lease::GatewayLease;
@@ -45,6 +46,7 @@ pub struct RedisAdmissionProvider<R = RedisService> {
     ttl_ms: u64,
     participation: Option<Arc<GatewayLease>>,
     discovery: Arc<RecorderDiscovery>,
+    policy: Arc<policy::PolicyStore>,
 }
 
 impl<R> Clone for RedisAdmissionProvider<R> {
@@ -56,6 +58,7 @@ impl<R> Clone for RedisAdmissionProvider<R> {
             ttl_ms: self.ttl_ms,
             participation: self.participation.clone(),
             discovery: Arc::clone(&self.discovery),
+            policy: Arc::clone(&self.policy),
         }
     }
 }
@@ -86,10 +89,16 @@ impl<R: Redis + 'static> RedisAdmissionProvider<R> {
         if recorder_url_key.is_empty() {
             return Err(RedisAdmissionConfigError::EmptyRecorderKey);
         }
+        if recorder_url_key == format!("{key_prefix}:api-policy")
+            || recorder_url_key == format!("{key_prefix}:api-counts")
+        {
+            return Err(RedisAdmissionConfigError::RecorderKeyConflict);
+        }
         let ms = ttl.as_millis();
         if ms == 0 || ms > i64::MAX as u128 || ttl.subsec_nanos() % 1_000_000 != 0 {
             return Err(RedisAdmissionConfigError::InvalidTtl);
         }
+        let policy = Arc::new(policy::PolicyStore::new(&key_prefix));
         Ok(Self {
             redis: Arc::new(redis),
             key_prefix,
@@ -97,7 +106,16 @@ impl<R: Redis + 'static> RedisAdmissionProvider<R> {
             ttl_ms: ms as u64,
             participation: None,
             discovery: Arc::new(RecorderDiscovery::default()),
+            policy,
         })
+    }
+
+    /// Loads `<key_prefix>:api-policy` once and atomically publishes a compiled
+    /// snapshot to all clones. Missing policy means all paths with no case cap.
+    /// Invalid/failed loads preserve the last valid snapshot. Calls are bounded
+    /// to 200 ms, including waiting for another load. Counts are never reset.
+    pub async fn load_policy(&self) -> Result<(), AdmissionError> {
+        self.policy.load(self.redis.as_ref()).await
     }
 
     /// Returns the configured request-reservation TTL. Receivers can schedule
@@ -131,6 +149,7 @@ impl<R: Redis + 'static> RedisAdmissionProvider<R> {
             Arc::clone(&self.redis),
             self.key_prefix.clone(),
             config,
+            Arc::clone(&self.policy),
         )?));
         Ok(self)
     }
@@ -205,59 +224,122 @@ impl<R: Redis + 'static> RedisAdmissionProvider<R> {
     }
 }
 
+impl<R: Redis + 'static> RedisAdmissionProvider<R> {
+    async fn acquire(
+        &self,
+        scope: &str,
+        quota: Option<(&str, u64)>,
+    ) -> Result<AcquireOutcome, AdmissionError> {
+        if !self.is_participating() {
+            return Ok(AcquireOutcome::NotParticipant);
+        }
+        if self.key(scope) == self.recorder_url_key {
+            return Err(AdmissionError::backend(std::io::Error::other(
+                "recorder URL key conflicts with slot key",
+            )));
+        }
+        let lookup_guard = match self.discovery.try_lookup() {
+            Ok(guard) => guard,
+            Err(LookupUnavailable::CoolingDown) => return Ok(AcquireOutcome::NoRecorder),
+            Err(LookupUnavailable::InProgress) => return Ok(AcquireOutcome::Busy),
+        };
+        let mut lookup = cmd("GET");
+        lookup.arg(&self.recorder_url_key);
+        // Route discovery to the writer, avoiding stale replica reads.
+        let result: Value = self
+            .redis
+            .command(lookup)
+            .await
+            .map_err(AdmissionError::backend)?;
+        let origin = match result {
+            Value::Nil => return Ok(AcquireOutcome::NoRecorder),
+            Value::BulkString(bytes) => registration::origin(&bytes)?,
+            _ => return Err(AdmissionError::InvalidRecorderUrl),
+        };
+        if let Some((api, limit)) = quota {
+            let mut command = cmd("HGET");
+            command.arg(&self.policy.counts_key).arg(api);
+            let value: Value = self
+                .redis
+                .command(command)
+                .await
+                .map_err(AdmissionError::backend)?;
+            let count = match value {
+                Value::Nil => 0,
+                Value::BulkString(bytes)
+                    if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit) =>
+                {
+                    std::str::from_utf8(&bytes)
+                        .ok()
+                        .and_then(|text| text.parse::<u64>().ok())
+                        .ok_or_else(|| policy::invalid("API count must be a nonnegative integer"))?
+                }
+                _ => return Err(policy::invalid("API count must be a nonnegative integer")),
+            };
+            if count >= limit {
+                lookup_guard.available();
+                return Ok(AcquireOutcome::QuotaExhausted);
+            }
+        }
+        let token = format!(
+            "{:032x}{:032x}",
+            rand::random::<u128>(),
+            rand::random::<u128>()
+        );
+        let ticket = AdmissionTicket::new(scope, &token)?.with_origin(origin)?;
+        if !reserve(
+            self.redis.as_ref(),
+            &self.key(scope),
+            ticket.token(),
+            self.ttl_ms,
+        )
+        .await?
+        {
+            lookup_guard.available();
+            return Ok(AcquireOutcome::Busy);
+        }
+        if let Some((api, _)) = quota {
+            let mut command = cmd("HINCRBY");
+            command.arg(&self.policy.counts_key).arg(api).arg(1);
+            let value: Value = self
+                .redis
+                .command(command)
+                .await
+                .map_err(AdmissionError::backend)?;
+            if !matches!(value, Value::Int(count) if count > 0) {
+                return Err(policy::invalid("unexpected API count increment response"));
+            }
+        }
+        // Check again after all Redis operations, including count updates.
+        // An unused reservation remains until completion or TTL recovery.
+        if !self.is_participating() {
+            return Err(AdmissionError::ParticipationLost);
+        }
+        lookup_guard.available();
+        Ok(AcquireOutcome::Acquired(ticket))
+    }
+}
+
 impl<R: Redis + 'static> AdmissionProvider for RedisAdmissionProvider<R> {
     fn try_acquire<'a>(&'a self, scope: &'a str) -> AdmissionFuture<'a> {
+        // Recorder-side and legacy route admission retain the lock-only path.
+        Box::pin(self.acquire(scope, None))
+    }
+
+    fn try_acquire_request<'a>(&'a self, scope: &'a str, path: &'a str) -> AdmissionFuture<'a> {
         Box::pin(async move {
             if !self.is_participating() {
                 return Ok(AcquireOutcome::NotParticipant);
             }
-            if self.key(scope) == self.recorder_url_key {
-                return Err(AdmissionError::backend(std::io::Error::other(
-                    "recorder URL key conflicts with slot key",
-                )));
-            }
-            let lookup_guard = match self.discovery.try_lookup() {
-                Ok(guard) => guard,
-                Err(LookupUnavailable::CoolingDown) => return Ok(AcquireOutcome::NoRecorder),
-                Err(LookupUnavailable::InProgress) => return Ok(AcquireOutcome::Busy),
+            let snapshot = self.policy.snapshot();
+            let Some(policy) = &snapshot.policy else {
+                return Ok(AcquireOutcome::NotEligible);
             };
-            let mut lookup = cmd("GET");
-            lookup.arg(&self.recorder_url_key);
-            // Route discovery to the writer, avoiding stale replica reads.
-            let result: Value = self
-                .redis
-                .command(lookup)
+            let Some(api) = policy.api(path) else {
+                return Ok(AcquireOutcome::NotEligible);
+            };
+            self.acquire(scope, policy.case_limit.map(|limit| (api, limit)))
                 .await
-                .map_err(AdmissionError::backend)?;
-            let origin = match result {
-                Value::Nil => return Ok(AcquireOutcome::NoRecorder),
-                Value::BulkString(bytes) => registration::origin(&bytes)?,
-                _ => return Err(AdmissionError::InvalidRecorderUrl),
-            };
-            let token = format!(
-                "{:032x}{:032x}",
-                rand::random::<u128>(),
-                rand::random::<u128>()
-            );
-            let ticket = AdmissionTicket::new(scope, &token)?.with_origin(origin)?;
-            if !reserve(
-                self.redis.as_ref(),
-                &self.key(scope),
-                ticket.token(),
-                self.ttl_ms,
-            )
-            .await?
-            {
-                lookup_guard.available();
-                return Ok(AcquireOutcome::Busy);
-            }
-            // The gateway falls back before dispatch on participation loss.
-            // An unused reservation remains until completion or TTL recovery.
-            if !self.is_participating() {
-                return Err(AdmissionError::ParticipationLost);
-            }
-            lookup_guard.available();
-            Ok(AcquireOutcome::Acquired(ticket))
         })
     }
 }
@@ -287,6 +369,8 @@ async fn reserve<R: Redis>(
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedisAdmissionConfigError {
+    #[error("recorder URL key conflicts with API policy or counts key")]
+    RecorderKeyConflict,
     #[error("Redis admission key prefix must not be empty")]
     EmptyPrefix,
     #[error("Redis recorder URL key must not be empty")]

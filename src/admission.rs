@@ -124,6 +124,10 @@ pub enum AcquireOutcome {
     NoRecorder,
     /// This gateway has no current participation lease. No request was sent.
     NotParticipant,
+    /// The request is excluded by the local API policy, or policy is not loaded.
+    NotEligible,
+    /// This API has reached its configured case limit.
+    QuotaExhausted,
 }
 
 pub type AdmissionFuture<'a> =
@@ -135,6 +139,12 @@ pub type AdmissionFuture<'a> =
 /// timeouts allow the gateway to forward that request to its fallback.
 pub trait AdmissionProvider: Send + Sync + 'static {
     fn try_acquire<'a>(&'a self, scope: &'a str) -> AdmissionFuture<'a>;
+
+    /// Request-aware admission. `path` is the URI path without its query.
+    /// Existing providers and recorder-side reservations keep their old contract.
+    fn try_acquire_request<'a>(&'a self, scope: &'a str, _path: &'a str) -> AdmissionFuture<'a> {
+        self.try_acquire(scope)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
