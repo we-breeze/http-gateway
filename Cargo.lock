@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "brz-http-gateway"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "arc-swap",
  "brz-http-cors",
