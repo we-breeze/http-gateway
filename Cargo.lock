@@ -145,9 +145,9 @@ dependencies = [
 
 [[package]]
 name = "brz-net"
-version = "0.0.7"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b737faa5dc1cfc22c2b531b4dc937b31ce00156a689da88513ec0e224cf0f95b"
+checksum = "d8b8b9eed63aff8293189dc925715f973d09115b48292751a6e851f2e0b247d0"
 dependencies = [
  "arc-swap",
  "atomic-waker",
@@ -161,9 +161,9 @@ dependencies = [
 
 [[package]]
 name = "brz-redis"
-version = "0.0.17"
+version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346768e29efbfa0ecfaa9858e286ad71fa44201f5452283ad512853cb5f7694f"
+checksum = "ee464c4a6ea6dcf4cfb973ff5687af4c626202e89cea30487ce05af413d57482"
 dependencies = [
  "arc-swap",
  "brz-net",
