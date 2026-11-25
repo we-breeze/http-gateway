@@ -1241,7 +1241,7 @@ mod cases {
         .await
     }
 
-    async fn command_fixture(
+    pub(super) async fn command_fixture(
         reply: impl Fn(Vec<Vec<u8>>) -> Option<Vec<u8>> + Send + Sync + 'static,
     ) -> (RedisService, tokio::task::JoinHandle<()>) {
         use std::sync::Arc;
