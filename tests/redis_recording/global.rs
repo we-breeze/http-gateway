@@ -86,6 +86,12 @@ impl ScriptCache {
                 assert_eq!(args[1], digest.as_bytes());
                 assert_eq!(args[2], b"1");
                 assert_eq!(args[3], b"script-cache-test:inflight");
+                assert_eq!(args.len(), 9);
+                let now = std::str::from_utf8(&args[8])
+                    .unwrap()
+                    .parse::<u128>()
+                    .unwrap();
+                assert!((1_000_000_000_000..(1_u128 << 53)).contains(&now));
                 let name = match args[4].as_slice() {
                     b"reserve" => "EVALSHA reserve",
                     b"owns" => "EVALSHA owns",

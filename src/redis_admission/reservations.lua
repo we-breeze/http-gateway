@@ -6,8 +6,7 @@ if kind ~= 'zset' and kind ~= 'none' then
     return redis.error_reply('unexpected recording reservation key type')
 end
 
-local time = redis.call('TIME')
-local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+local now = tonumber(ARGV[5])
 redis.call('ZREMRANGEBYSCORE', key, '-inf', string.format('%.0f', now))
 
 if operation == 'complete' then

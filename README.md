@@ -313,7 +313,9 @@ release if the quota has already been reached.
 Use the same single Redis writer for Recorder and gateway. The Recorder
 loads the global reservation script with `SCRIPT LOAD` before publishing its
 address and checks the script cache during address renewals. All global lease
-operations use `EVALSHA`. A cache miss returns an error to the caller. The
+operations use `EVALSHA` and pass the current Unix time in milliseconds so
+Redis can replicate the script deterministically. Keep gateway, Recorder and
+Redis host clocks synchronized. A cache miss returns an error to the caller. The
 Recorder restores the cache on its next successful address heartbeat, or
 when it republishes after Redis loses the address.
 
