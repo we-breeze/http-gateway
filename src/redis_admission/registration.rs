@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use super::reservations;
+
 #[derive(Serialize, Deserialize)]
 struct Address {
     url: String,
@@ -26,6 +28,7 @@ pub struct RecorderRegistration<R> {
     key: String,
     value: String,
     ttl_ms: u64,
+    global: bool,
 }
 
 impl<R: Redis> RecorderRegistration<R> {
@@ -55,6 +58,7 @@ impl<R: Redis> RecorderRegistration<R> {
             key,
             value,
             ttl_ms: ms as u64,
+            global: false,
         })
     }
 
@@ -65,15 +69,23 @@ impl<R: Redis> RecorderRegistration<R> {
             serde_json::from_str(&self.value).map_err(AdmissionError::backend)?;
         address.max_inflight = Some(max_inflight);
         self.value = serde_json::to_string(&address).map_err(AdmissionError::backend)?;
+        self.global = true;
         Ok(self)
     }
 
     pub async fn register(&self) -> Result<bool, AdmissionError> {
+        if self.global {
+            reservations::load(&self.redis).await?;
+        }
         super::reserve(&self.redis, &self.key, &self.value, self.ttl_ms).await
     }
 
     pub async fn renew(&self) -> Result<bool, AdmissionError> {
-        self.transition("if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) end return 0").await
+        let renewed = self.transition("if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) end return 0").await?;
+        if renewed && self.global {
+            reservations::ensure_loaded(&self.redis).await?;
+        }
+        Ok(renewed)
     }
 
     pub async fn unregister(&self) -> Result<bool, AdmissionError> {

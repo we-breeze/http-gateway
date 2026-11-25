@@ -310,6 +310,13 @@ shared pool has capacity. If configured, the existing per-API case quota is
 checked and incremented atomically on the count key, with scope-free ticket
 release if the quota has already been reached.
 
+Use the same single Redis writer for Recorder and gateway. The Recorder
+loads the global reservation script with `SCRIPT LOAD` before publishing its
+address and checks the script cache during address renewals. All global lease
+operations use `EVALSHA`. A cache miss returns an error to the caller. The
+Recorder restores the cache on its next successful address heartbeat, or
+when it republishes after Redis loses the address.
+
 The gateway attaches only `x-breeze-admission-token` in global mode. The
 recorder reads it with `AdmissionTicket::from_global_headers` and calls
 `RedisAdmissionProvider::renew` and `complete` for that ticket. Both operations
