@@ -1,4 +1,8 @@
-use std::{io, sync::LazyLock};
+use std::{
+    io,
+    sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use brz_redis::{Redis, Value, cmd};
 use sha1::{Digest, Sha1};
@@ -48,13 +52,20 @@ pub(super) async fn transition<R: Redis>(
     ttl_ms: u64,
     max_inflight: u32,
 ) -> Result<bool, AdmissionError> {
+    // Pass the time as an argument so script-replicating Redis can replay
+    // the same decisions without executing a nondeterministic TIME command.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(AdmissionError::backend)?
+        .as_millis()
+        .to_string();
     let ttl = ttl_ms.to_string();
     let limit = max_inflight.to_string();
     let result: Value = redis
         .evalsha(
             SCRIPT_SHA.as_str(),
             &[key],
-            &[operation, token, ttl.as_str(), limit.as_str()],
+            &[operation, token, ttl.as_str(), limit.as_str(), now.as_str()],
         )
         .await
         .map_err(AdmissionError::backend)?;
