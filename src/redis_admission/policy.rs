@@ -12,10 +12,21 @@ use tokio::sync::Mutex;
 use crate::AdmissionError;
 
 const LOAD_TIMEOUT: Duration = Duration::from_millis(200);
+const TRY_INCREMENT: &str = r#"
+local count = redis.call('HGET', KEYS[1], ARGV[1]) or '0'
+if not string.match(count, '^%d+$') then
+    return redis.error_reply('API count must be a nonnegative integer')
+end
+local limit = ARGV[2]
+-- Compare decimal strings to keep the full Redis integer range.
+if #count > #limit or (#count == #limit and count >= limit) then return 0 end
+redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+return 1
+"#;
 
 pub(super) struct PolicyStore {
     pub(super) key: String,
-    pub(super) counts_key: String,
+    counts_key: String,
     snapshot: ArcSwap<Snapshot>,
     loading: Mutex<()>,
 }
@@ -40,6 +51,70 @@ impl PolicyStore {
 
     pub(super) fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.load_full()
+    }
+
+    pub(super) async fn case_count<R: Redis>(
+        &self,
+        redis: &R,
+        api: &str,
+    ) -> Result<u64, AdmissionError> {
+        let mut command = cmd("HGET");
+        command.arg(&self.counts_key).arg(api);
+        let value: Value = redis
+            .command(command)
+            .await
+            .map_err(AdmissionError::backend)?;
+        match value {
+            Value::Nil => Ok(0),
+            Value::BulkString(bytes)
+                if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit) =>
+            {
+                std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    .ok_or_else(|| invalid("API count must be a nonnegative integer"))
+            }
+            _ => Err(invalid("API count must be a nonnegative integer")),
+        }
+    }
+
+    pub(super) async fn increment<R: Redis>(
+        &self,
+        redis: &R,
+        api: &str,
+    ) -> Result<(), AdmissionError> {
+        let mut command = cmd("HINCRBY");
+        command.arg(&self.counts_key).arg(api).arg(1);
+        let value: Value = redis
+            .command(command)
+            .await
+            .map_err(AdmissionError::backend)?;
+        if !matches!(value, Value::Int(count) if count > 0) {
+            return Err(invalid("unexpected API count increment response"));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn try_increment<R: Redis>(
+        &self,
+        redis: &R,
+        api: &str,
+        limit: u64,
+    ) -> Result<bool, AdmissionError> {
+        let limit = limit.to_string();
+        let result: Value = redis
+            .eval(
+                TRY_INCREMENT,
+                &[self.counts_key.as_str()],
+                &[api, limit.as_str()],
+            )
+            .await
+            .map_err(AdmissionError::backend)?;
+        match result {
+            Value::Int(0) => Ok(false),
+            Value::Int(1) => Ok(true),
+            _ => Err(invalid("unexpected API count increment response")),
+        }
     }
 
     pub(super) async fn load<R: Redis>(&self, redis: &R) -> Result<(), AdmissionError> {

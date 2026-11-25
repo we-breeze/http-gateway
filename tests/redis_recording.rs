@@ -11,6 +11,9 @@ use brz_redis::{Redis, RedisService, RedisServiceOptions, cmd};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[path = "redis_recording/global.rs"]
+mod global;
+
 async fn provider(prefix: &str, ttl: Duration) -> Option<RedisAdmissionProvider> {
     let endpoint = std::env::var("BREEZE_REDIS_TEST_ENDPOINT").ok()?;
     let redis = RedisService::single_with_options(

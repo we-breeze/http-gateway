@@ -23,7 +23,7 @@ pub(super) enum LookupUnavailable {
 }
 
 impl RecorderDiscovery {
-    pub(super) fn try_lookup(&self) -> Result<Lookup<'_>, LookupUnavailable> {
+    pub(super) fn try_lookup(&self, parallel: bool) -> Result<Lookup<'_>, LookupUnavailable> {
         let mut state = self.state.lock().expect("recorder discovery lock poisoned");
         if state
             .retry_after
@@ -35,10 +35,16 @@ impl RecorderDiscovery {
             // Never queue application requests behind another admission attempt.
             return Err(LookupUnavailable::InProgress);
         }
-        state.checking = true;
+        // Recovery after a failure admits a single probe. A healthy global pool
+        // must be able to discover and reserve more than one request at a time.
+        let exclusive = !parallel || state.retry_after.is_some();
+        if exclusive {
+            state.checking = true;
+        }
         Ok(Lookup {
             discovery: self,
             available: false,
+            exclusive,
         })
     }
 }
@@ -46,6 +52,7 @@ impl RecorderDiscovery {
 pub(super) struct Lookup<'a> {
     discovery: &'a RecorderDiscovery,
     available: bool,
+    exclusive: bool,
 }
 
 impl Lookup<'_> {
@@ -61,7 +68,9 @@ impl Drop for Lookup<'_> {
             .state
             .lock()
             .expect("recorder discovery lock poisoned");
-        state.checking = false;
+        if self.exclusive {
+            state.checking = false;
+        }
         // Cancellation from GET or SET acquisition timeouts also backs off.
         state.retry_after = (!self.available).then(|| Instant::now() + RECORDER_RETRY_INTERVAL);
     }

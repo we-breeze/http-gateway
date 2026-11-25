@@ -229,6 +229,11 @@ let gateway = Gateway::with_admission(
 # }
 ```
 
+Recorder-side applications that only use the Redis registration and admission
+APIs can set `default-features = false, features = ["redis-recording"]`. The
+`route-config` feature exposes route validation without the proxy or server.
+The default `http-gateway` feature includes both route validation and serving.
+
 Every gateway in a recorder group must enable `with_gateway_limit` before
 cloning/registering its provider. This starts one background task shared by its
 clones. Use a unique `instance_id` for each gateway, or leave it empty (including
@@ -267,15 +272,16 @@ instances. Already admitted recordings continue and retain their request slot.
 A provider without `with_gateway_limit` is unrestricted; this is
 useful for completion adapters, which should not take gateway slots.
 
-With one shared request scope, there are N + 3 keys (all Redis strings). Old
-participation keys can briefly remain during shrinking or TTL recovery:
+Old participation keys can briefly remain during shrinking or TTL recovery.
+The request keys depend on the selected admission protocol.
 
 | Key | Value | Expiration |
 | --- | --- | --- |
-| `recording:orders:url` (configurable) | Plain HTTP origin, or JSON `{"url":"http://10.0.0.12:9001","owner":"<boot token>"}` | Managed by the address publisher |
+| `recording:orders:url` (configurable) | Plain HTTP origin, or owned JSON address with optional `max_inflight` | Managed by the address publisher |
 | `recording:orders:max-gateways` | Decimal N, e.g. `2` | Configuration, no default TTL |
 | `recording:orders:gateway:0` through `:gateway:N-1` | `<instance-id>:<32 hex boot token>` | 30 seconds, renewed |
 | `recording:orders:inflight:all-writes` | `<64 hex request token>` | 60 seconds, receiver can renew |
+| `recording:orders:inflight` | Sorted set of global request tokens, scored by expiration | Each member expires independently, receiver can renew |
 
 Publish the recorder's origin-only HTTP URL and global participation limit:
 
@@ -293,6 +299,23 @@ owner cannot renew or delete a replacement; expiry permits replacement after a
 crash. These primitives create no background task on their own. The externally
 managed plain URL format remains supported.
 
+For global recording, configure the gateway with
+`gateway.with_global_recording("recorder", 50)?`. Before publishing its
+address, the recorder advertises the same capacity as its HTTP ingress with
+`registration.with_max_inflight(NonZeroU32::new(8).unwrap())?`. The lease
+includes a positive `max_inflight` JSON field, including when the requested
+capacity is one. Global admission requires this field. After lookup, Redis
+atomically reclaims expired entries and reserves a request only when the
+shared pool has capacity. If configured, the existing per-API case quota is
+checked and incremented atomically on the count key, with scope-free ticket
+release if the quota has already been reached.
+
+The gateway attaches only `x-breeze-admission-token` in global mode. The
+recorder reads it with `AdmissionTicket::from_global_headers` and calls
+`RedisAdmissionProvider::renew` and `complete` for that ticket. Both operations
+address only the matching live reservation. A long-running request can hold
+one slot while other admitted requests use the remaining slots.
+
 For participating gateways, each request first uses `GET <recorder_url_key>` on
 the Redis writer unless a local retry cooldown is active. A missing address
 permits fallback; failures or invalid URLs are errors and the gateway also
@@ -300,11 +323,12 @@ falls back. Missing/invalid discovery, Redis errors and acquisition timeouts
 start a 10 second cooldown shared by all provider clones and request scopes.
 During that period requests fall back locally without any request-level Redis
 commands. The next request after expiry may retry; other concurrent requests
-fall back immediately while that attempt runs. Cancellation during either GET
-or SET also starts the cooldown. Successful discovery and reservation, including
-an explicit SET NX Busy rejection, clear the cooldown. Busy request slots are
-not cached, allowing admission as soon as the recorder releases its slot.
-After discovery, acquisition uses one
+fall back immediately while that attempt runs. Healthy global discovery and
+reservation can run concurrently. Cancellation during discovery or acquisition
+also starts the cooldown. Successful discovery and a definitive reservation
+result clear the cooldown. Busy request slots are not cached, allowing
+admission as soon as the recorder releases its slot.
+In scoped mode, acquisition uses one
 `SET <prefix>:inflight:<scope> <token> NX PX 60000`. All APIs recorded by one
 single-case recorder must share the same scope; separate scopes permit separate
 concurrent requests.

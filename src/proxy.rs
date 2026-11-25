@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::error::Error;
 use std::net::SocketAddr;
 
 use brz_http_server::hyper::{
@@ -17,6 +16,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tracing::debug;
 
+use crate::BoxError;
+
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
@@ -31,7 +32,6 @@ pub(crate) struct RecordingFallback(pub(crate) FallbackProxy);
 /// The HTTP client failed to establish a connection, before request dispatch.
 struct ConnectFailure;
 
-pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type GatewayBody = BoxBody<Bytes, BoxError>;
 pub type GatewayResponse = Response<GatewayBody>;
 
