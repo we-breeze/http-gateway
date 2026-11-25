@@ -35,6 +35,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - run: cargo check --locked --lib --no-default-features --features redis-recording,route-config
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
       - run: cargo test --locked --release --all-features

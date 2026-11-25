@@ -67,6 +67,16 @@ impl AdmissionProvider for Decision {
             }
         })
     }
+
+    fn try_acquire_global_request<'a>(&'a self, path: &'a str) -> AdmissionFuture<'a> {
+        assert_eq!(path, "/global");
+        Box::pin(async move {
+            assert!(matches!(self, Self::Acquired));
+            Ok(AcquireOutcome::Acquired(AdmissionTicket::new_global(
+                "valid-token",
+            )?))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -85,7 +95,19 @@ impl MatchedService for Selected {
         let status = self.status;
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            if request.uri().path() != "/unrestricted" {
+            if request.uri().path() == "/global" {
+                let ticket = AdmissionTicket::from_global_headers(request.headers())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ticket.token(), "valid-token");
+                assert!(
+                    request
+                        .extensions()
+                        .get::<AdmissionTicket>()
+                        .unwrap()
+                        .is_global()
+                );
+            } else if request.uri().path() != "/unrestricted" {
                 let ticket = request.extensions().get::<AdmissionTicket>().unwrap();
                 assert_eq!(ticket.scope(), "all-writes");
                 assert_eq!(ticket.token(), "valid-token");
@@ -220,6 +242,41 @@ async fn exercise_mode(
 }
 
 #[tokio::test]
+async fn global_pool_forwards_only_the_issued_token() {
+    let selected = Selected {
+        calls: Arc::new(AtomicUsize::new(0)),
+        status: StatusCode::CREATED,
+    };
+    let mut registry = AdmissionRegistry::new();
+    registry.register("recorder", Decision::Acquired).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let gateway = Gateway::with_admission(
+        RouteTable::empty(),
+        selected,
+        &"http://127.0.0.1:1".parse().unwrap(),
+        registry,
+    )
+    .unwrap()
+    .with_global_recording("recorder", 50)
+    .unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let task = tokio::spawn(brz_http_gateway::serve(
+        listener,
+        gateway,
+        async move {
+            let _ = stopped.await;
+        },
+        Duration::from_secs(1),
+    ));
+    let response = request(address, "GET", "/global?query=1").await;
+    assert!(response.starts_with("HTTP/1.1 201"));
+    assert!(response.ends_with("selected"));
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn global_admission_uses_empty_routes_and_existing_provider_implementations() {
     exercise_mode(
         Decision::Acquired,
@@ -348,4 +405,15 @@ fn tickets_validate_headers_and_redact_tokens() {
     );
     headers.append(ADMISSION_TOKEN_HEADER, "second".parse().unwrap());
     assert!(AdmissionTicket::from_headers(&headers).is_err());
+    assert!(AdmissionTicket::from_global_headers(&headers).is_err());
+    headers.remove(ADMISSION_SCOPE_HEADER);
+    assert!(AdmissionTicket::from_global_headers(&headers).is_err());
+    headers.insert(ADMISSION_TOKEN_HEADER, "global-token".parse().unwrap());
+    assert!(AdmissionTicket::from_headers(&headers).is_err());
+    let global = AdmissionTicket::from_global_headers(&headers)
+        .unwrap()
+        .unwrap();
+    assert!(global.is_global());
+    assert_eq!(global.token(), "global-token");
+    assert!(!format!("{global:?}").contains("global-token"));
 }

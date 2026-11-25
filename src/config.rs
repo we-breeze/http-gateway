@@ -198,6 +198,7 @@ impl RouteTable {
         self.exclusions.matches(method, path)
     }
 
+    #[cfg(any(feature = "http-gateway", test))]
     pub(crate) fn admissions(&self) -> &[Option<AdmissionRule>] {
         &self.admissions
     }

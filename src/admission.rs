@@ -3,7 +3,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use http::{HeaderMap, HeaderValue, Request, Uri};
+#[cfg(feature = "http-gateway")]
+use http::Request;
+use http::{HeaderMap, HeaderValue, Uri};
 
 use crate::BoxError;
 
@@ -15,7 +17,7 @@ pub const ADMISSION_TOKEN_HEADER: &str = "x-breeze-admission-token";
 /// Dropping a ticket does not release its reservation.
 #[derive(Clone)]
 pub struct AdmissionTicket {
-    scope: HeaderValue,
+    scope: Option<HeaderValue>,
     token: HeaderValue,
     origin: Option<Uri>,
 }
@@ -23,28 +25,40 @@ pub struct AdmissionTicket {
 impl AdmissionTicket {
     /// Creates a ticket whose values can safely travel in HTTP headers.
     pub fn new(scope: &str, token: &str) -> Result<Self, AdmissionError> {
-        if scope.trim().is_empty()
-            || token.trim().is_empty()
-            || !scope.is_ascii()
-            || !token.is_ascii()
-        {
+        if scope.trim().is_empty() || !scope.is_ascii() {
             return Err(AdmissionError::InvalidTicket);
         }
         let scope = HeaderValue::from_str(scope).map_err(|_| AdmissionError::InvalidTicket)?;
+        let mut ticket = Self::new_global(token)?;
+        ticket.scope = Some(scope);
+        Ok(ticket)
+    }
+
+    /// Creates a ticket for global recording admission without a scope header.
+    pub fn new_global(token: &str) -> Result<Self, AdmissionError> {
+        if token.trim().is_empty() || !token.is_ascii() {
+            return Err(AdmissionError::InvalidTicket);
+        }
         let mut token = HeaderValue::from_str(token).map_err(|_| AdmissionError::InvalidTicket)?;
         token.set_sensitive(true);
         Ok(Self {
-            scope,
+            scope: None,
             token,
             origin: None,
         })
     }
 
+    /// Returns the scope of a scoped ticket, or an empty string for a global ticket.
     #[must_use]
     pub fn scope(&self) -> &str {
-        self.scope
-            .to_str()
-            .expect("ticket contains a string header")
+        self.scope.as_ref().map_or("", |scope| {
+            scope.to_str().expect("ticket has an ASCII scope")
+        })
+    }
+
+    #[must_use]
+    pub fn is_global(&self) -> bool {
+        self.scope.is_none()
     }
 
     #[must_use]
@@ -95,10 +109,28 @@ impl AdmissionTicket {
         }
     }
 
+    /// Reads a token-only ticket for a global recording completion adapter.
+    pub fn from_global_headers(headers: &HeaderMap) -> Result<Option<Self>, AdmissionError> {
+        if headers.contains_key(ADMISSION_SCOPE_HEADER) {
+            return Err(AdmissionError::InvalidTicket);
+        }
+        let mut tokens = headers.get_all(ADMISSION_TOKEN_HEADER).iter();
+        let Some(token) = tokens.next() else {
+            return Ok(None);
+        };
+        if tokens.next().is_some() {
+            return Err(AdmissionError::InvalidTicket);
+        }
+        Self::new_global(token.to_str().map_err(|_| AdmissionError::InvalidTicket)?).map(Some)
+    }
+
+    #[cfg(feature = "http-gateway")]
     pub(crate) fn attach<B>(&self, request: &mut Request<B>) {
-        request
-            .headers_mut()
-            .insert(ADMISSION_SCOPE_HEADER, self.scope.clone());
+        if let Some(scope) = &self.scope {
+            request
+                .headers_mut()
+                .insert(ADMISSION_SCOPE_HEADER, scope.clone());
+        }
         request
             .headers_mut()
             .insert(ADMISSION_TOKEN_HEADER, self.token.clone());
@@ -144,6 +176,11 @@ pub trait AdmissionProvider: Send + Sync + 'static {
     /// Existing providers and recorder-side reservations keep their old contract.
     fn try_acquire_request<'a>(&'a self, scope: &'a str, _path: &'a str) -> AdmissionFuture<'a> {
         self.try_acquire(scope)
+    }
+
+    /// Request-aware admission for a provider's global recording pool.
+    fn try_acquire_global_request<'a>(&'a self, _path: &'a str) -> AdmissionFuture<'a> {
+        Box::pin(std::future::ready(Ok(AcquireOutcome::NotEligible)))
     }
 }
 
@@ -208,6 +245,7 @@ impl AdmissionRegistry {
         }
     }
 
+    #[cfg(feature = "http-gateway")]
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<dyn AdmissionProvider>> {
         self.providers.get(name)
     }
